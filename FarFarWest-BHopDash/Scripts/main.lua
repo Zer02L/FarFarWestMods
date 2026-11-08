@@ -1,53 +1,46 @@
 --[[
-    BHopDash Enhanced v10.0 for Far Far West
+    BHopDash Enhanced v11.0 for Far Far West
     UE4SS 3.0.x Lua Mod
 
     Features:
-    - Auto-BHop: Press Space to start chaining hops. Automatically executes perfect jump on EVERY landing while moving!
-    - Dash-Hop: Press/hold LeftShift to auto-dash on landing and launch into the air carrying dash momentum.
-    - Zero crash on exit: All callbacks to ExecuteInGameThread are static persistent functions (zero registry leaks).
+    - Pure Auto-BHop: Automatically jumps with perfect timing on EVERY landing!
+    - Dash-Hop: Press LeftShift to trigger landing dash + jump launch.
+    - Robust air/ground transition via MovementMode (MOVE_Falling -> MOVE_Walking).
     - LaunchCharacter + Jump dual execution for 100% reliable physical jumps.
+    - Zero closures, zero registry leaks, zero crash on exit.
 --]]
 
 local UEHelpers = require("UEHelpers")
 
 local config = {
     ENABLED = true,
-    DASH_KEY = "LeftShift",
-    BHOP_KEY = "SpaceBar",
-    AUTO_BHOP_ENABLED = true,
+    ALWAYS_BHOP = true,              -- Automatically jump on every landing!
     AUTO_DASH_ENABLED = true,
     AUTO_JUMP_AFTER_DASH = true,
     RESET_DASH_COOLDOWN = true,
-    ALWAYS_BHOP_WHEN_MOVING = false,
     POLL_MS = 10,
     DEBUG = true
 }
 
 local CONFIG_FILENAME = "ue4ss/Mods/BHopDash/config.txt"
+local DUMP_FILENAME = "ue4ss/Mods/BHopDash/player_functions.txt"
 
 -- Runtime caches
 local cachedPC = nil
 local cachedPawn = nil
 local cachedCM = nil
 
-local wasGrounded = false
-local hadGroundState = false
+local wasInAir = false
 local gameTickQueued = false
+local dumpedFunctions = false
 
 -- State tracking
 local bhopActiveUntil = 0.0
 local dashHopActiveUntil = 0.0
-local lastLogTime = 0.0
+local jumpCount = 0
 
 local function log(msg)
     print("[BHopDash] " .. tostring(msg))
-end
-
-local function debugLog(msg)
-    if config.DEBUG then
-        log("[DEBUG] " .. tostring(msg))
-    end
 end
 
 local function trim(s)
@@ -77,16 +70,14 @@ local function loadConfig()
                 value = trim(value)
                 if key == "ENABLED" then
                     config.ENABLED = parseBool(value)
-                elseif key == "AUTO_BHOP_ENABLED" then
-                    config.AUTO_BHOP_ENABLED = parseBool(value)
+                elseif key == "ALWAYS_BHOP" then
+                    config.ALWAYS_BHOP = parseBool(value)
                 elseif key == "AUTO_DASH_ENABLED" then
                     config.AUTO_DASH_ENABLED = parseBool(value)
                 elseif key == "AUTO_JUMP_AFTER_DASH" then
                     config.AUTO_JUMP_AFTER_DASH = parseBool(value)
                 elseif key == "RESET_DASH_COOLDOWN" then
                     config.RESET_DASH_COOLDOWN = parseBool(value)
-                elseif key == "ALWAYS_BHOP_WHEN_MOVING" then
-                    config.ALWAYS_BHOP_WHEN_MOVING = parseBool(value)
                 elseif key == "POLL_MS" then
                     local n = tonumber(value)
                     if n and n >= 5 then config.POLL_MS = n end
@@ -97,13 +88,45 @@ local function loadConfig()
         end
     end
     file:close()
-    debugLog("Configuration loaded successfully.")
+    log(string.format("Config loaded: ALWAYS_BHOP=%s, AUTO_DASH=%s", tostring(config.ALWAYS_BHOP), tostring(config.AUTO_DASH_ENABLED)))
 end
 
 local function isValid(obj)
     if obj == nil then return false end
     local ok, res = pcall(function() return obj:IsValid() end)
     return ok and res == true
+end
+
+-- Comprehensive scan for player functions in both lobby and match
+local function dumpPlayerFunctions(pawn)
+    if dumpedFunctions or not isValid(pawn) then return end
+    dumpedFunctions = true
+
+    pcall(function()
+        local file = io.open(DUMP_FILENAME, "w")
+        if file then
+            file:write("=== Functions for " .. pawn:GetFullName() .. " ===\n")
+        end
+
+        log("Scanning UFunctions for " .. pawn:GetFullName())
+        ForeachUObject(function(obj)
+            local fullName = obj:GetFullName()
+            if (fullName:find("BP_Player", 1, true)) then
+                if fullName:find("Jump", 1, true) or fullName:find("Dash", 1, true) or fullName:find("Input", 1, true) or fullName:find("InpAct", 1, true) or fullName:find("Land", 1, true) then
+                    log("  UFunction: " .. fullName)
+                    if file then
+                        file:write(fullName .. "\n")
+                    end
+                end
+            end
+            return false
+        end)
+
+        if file then
+            file:close()
+            log("Saved player functions to " .. DUMP_FILENAME)
+        end
+    end)
 end
 
 local function acquirePlayer()
@@ -153,25 +176,17 @@ local function acquirePlayer()
     cachedPC = pc
     cachedPawn = pawn
     cachedCM = cm
-    wasGrounded = false
-    hadGroundState = false
+    wasInAir = false
 
     log("Local player acquired: " .. pawn:GetFullName())
+    dumpPlayerFunctions(pawn)
     return true
-end
-
-local function isCharacterMoving()
-    if not isValid(cachedCM) then return false end
-    local ok, vel = pcall(function() return cachedCM.Velocity end)
-    if ok and vel then
-        local speedSq = (vel.X or 0)^2 + (vel.Y or 0)^2
-        return speedSq > 2500 -- > 50 units/sec
-    end
-    return false
 end
 
 local function executeJump()
     if not isValid(cachedPawn) then return end
+
+    jumpCount = jumpCount + 1
 
     -- Unreal Character Jump
     pcall(function()
@@ -179,7 +194,7 @@ local function executeJump()
         cachedPawn:Jump()
     end)
 
-    -- Physical jump impulse
+    -- Guaranteed physical launch
     pcall(function()
         if isValid(cachedCM) then
             local zVel = 600.0
@@ -190,7 +205,7 @@ local function executeJump()
         end
     end)
 
-    log("Auto-Jump executed!")
+    log(string.format("Auto-Jump #%d executed!", jumpCount))
 end
 
 local function executeDash()
@@ -228,58 +243,36 @@ local function gameThreadTick()
         return
     end
 
-    local okG, onGround = pcall(function()
-        return cachedCM:IsMovingOnGround()
-    end)
+    -- Check if character is airborne
+    -- EMovementMode: 3 is MOVE_Falling (in air)
+    local mode = 1
+    pcall(function() mode = cachedCM.MovementMode end)
 
-    if not okG then
-        cachedCM = nil
-        wasGrounded = false
-        hadGroundState = false
-        return
+    local inAir = (mode == 3)
+    if not inAir then
+        pcall(function() inAir = cachedCM:IsFalling() end)
     end
-
-    onGround = (onGround == true)
 
     local now = os.clock()
-    local moving = isCharacterMoving()
+    local isBhopTriggered = config.ALWAYS_BHOP or (now < bhopActiveUntil)
+    local isDashTriggered = (now < dashHopActiveUntil)
 
-    -- Check if bhop or dash-hop is active
-    local bhopActive = config.AUTO_BHOP_ENABLED and (config.ALWAYS_BHOP_WHEN_MOVING or (now < bhopActiveUntil)) and moving
-    local dashActive = config.AUTO_DASH_ENABLED and (now < dashHopActiveUntil) and moving
+    -- LANDING DETECTED: was in air on previous tick, now grounded!
+    if wasInAir and not inAir then
+        log(string.format("Landing detected! BhopActive=%s, DashActive=%s", tostring(isBhopTriggered), tostring(isDashTriggered)))
 
-    if not hadGroundState then
-        hadGroundState = true
-        wasGrounded = onGround
-        if onGround then
-            if dashActive then
-                executeDash()
-                dashHopActiveUntil = now + 1.2
-            elseif bhopActive then
-                executeJump()
-                bhopActiveUntil = now + 1.2
-            end
-        end
-        return
-    end
-
-    -- Landing detected: was in air last tick, now on ground
-    if onGround and not wasGrounded then
-        if dashActive then
-            log("Landing with Dash-Hop active! Dashing and leaping...")
+        if isDashTriggered and config.AUTO_DASH_ENABLED then
             executeDash()
-            dashHopActiveUntil = now + 1.2
-        elseif bhopActive then
-            log("Landing with Bhop active! Hopping...")
+            dashHopActiveUntil = now + 1.5
+        elseif isBhopTriggered then
             executeJump()
-            bhopActiveUntil = now + 1.2
+            bhopActiveUntil = now + 1.5
         end
     end
 
-    wasGrounded = onGround
+    wasInAir = inAir
 end
 
--- Reused persistent loop callback - zero registry churn
 local function asyncLoopCallback()
     if not gameTickQueued then
         gameTickQueued = true
@@ -288,28 +281,28 @@ local function asyncLoopCallback()
     return false
 end
 
--- Static pre-declared callbacks for KeyBinds - zero closures, zero exit crashes
+-- Static callbacks for KeyBinds
 local function onSpaceKeyGameThread()
-    if acquirePlayer() and isValid(cachedCM) and cachedCM:IsMovingOnGround() then
+    if acquirePlayer() and isValid(cachedCM) and not cachedCM:IsFalling() then
         executeJump()
     end
 end
 
 local function onSpaceKeyPressed()
-    bhopActiveUntil = os.clock() + 1.2
-    log("Space pressed -> BHop chain activated!")
+    bhopActiveUntil = os.clock() + 1.5
+    log("Space pressed -> BHop chain active until " .. string.format("%.2f", bhopActiveUntil))
     ExecuteInGameThread(onSpaceKeyGameThread)
 end
 
 local function onShiftKeyGameThread()
-    if acquirePlayer() and isValid(cachedCM) and cachedCM:IsMovingOnGround() then
+    if acquirePlayer() and isValid(cachedCM) and not cachedCM:IsFalling() then
         executeDash()
     end
 end
 
 local function onShiftKeyPressed()
-    dashHopActiveUntil = os.clock() + 1.2
-    log("Shift pressed -> Dash-Hop chain activated!")
+    dashHopActiveUntil = os.clock() + 1.5
+    log("Shift pressed -> Dash-Hop chain active until " .. string.format("%.2f", dashHopActiveUntil))
     ExecuteInGameThread(onShiftKeyGameThread)
 end
 
@@ -319,5 +312,5 @@ loadConfig()
 RegisterKeyBind(Key.SPACE, onSpaceKeyPressed)
 RegisterKeyBind(Key.LEFT_SHIFT or 0x10, onShiftKeyPressed)
 
-log("BHopDash v10.0 initialized! Press Space to bunnyhop, Shift to dash-hop.")
+log(string.format("BHopDash v11.0 active! ALWAYS_BHOP=%s (Auto-hop on every landing).", tostring(config.ALWAYS_BHOP)))
 LoopAsync(config.POLL_MS, asyncLoopCallback)
