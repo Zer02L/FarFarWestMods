@@ -70,3 +70,27 @@ This skill provides essential guidelines for writing robust, thread-safe, and le
 14. **Conventional Commits & Shell Escaping**
     - Follow `type(scope): description` for git commits (enforced by pre-commit hook).
     - Wrap commit messages in single quotes `'...'` to prevent bash from executing backtick expressions.
+
+15. **Never select materials for 3D meshes blindly by name (Sprite / Billboard Trap)**
+    - Materials named `*Glow*` or `*Light*` in `/Game/FX/` often use 2D particle billboard textures (e.g. `T_Dot_01`), resulting in transparent `Alpha = 0.0` across 95%+ of 3D skeletal mesh UVs.
+    - Always use 3D surface/mesh materials (e.g. `/Game/Materials/M_Translucent_Orange`, `M_Translucent_Red`, `M_Translucent`).
+
+16. **Never rely only on `StaticFindObject` for packaged assets (Non-resident assets)**
+    - Unreal Engine assets in `.ucas`/`.pak` are not in `GUObjectArray` until loaded.
+    - Use two-step loading: `StaticFindObject(path)`, fallback to `LoadAsset(path)` in GameThread, then `StaticFindObject(path)` again.
+
+17. **Always probe custom engine signatures (e.g. `SetOverlayMaterial`)**
+    - In custom engine builds (Far Far West UE 5.8), `UMeshComponent::SetOverlayMaterial` takes 3 parameters: `(NewOverlayMaterial, bSetMaterialSlot, SlotIndex)`. Calling it with 1 argument throws errors every tick.
+    - For global character overlays, call `mesh:SetOverlayMaterial(mid, false, 0)` and probe once on startup.
+
+18. **Set `DepthBias = 0.0` on Dynamic Material Instances**
+    - Prevents z-fighting and polygon clipping between the translucent overlay and the underlying opaque mesh.
+
+19. **Include One-Shot Diagnostics in `UE4SS.log`**
+    - Log `mesh:GetOverlayMaterial()`, loaded material paths, and first keybind polling results once to immediately verify engine-level behavior without log spam.
+
+## Mod Creation & Deployment Workflow
+1. **Structure:** `Mods/<ModName>/enabled.txt` + `Mods/<ModName>/Scripts/main.lua`. Note Linux case-sensitivity (`Scripts/` vs `scripts/`).
+2. **Registration:** Add `<ModName> : 1` in `Mods/mods.txt`.
+3. **Pre-flight:** Always run `bun x luaparse path/to/main.lua` before testing in-game.
+4. **Deploy:** Sync changes from repo `~/Projects/FarFarWestMods/<ModName>/` to game `.../ue4ss/Mods/<ModName>/`.

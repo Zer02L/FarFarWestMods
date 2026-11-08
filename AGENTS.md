@@ -118,17 +118,158 @@ local function isValid(obj)
     return ok and res == true
 end
 
--- 2. Безопасный опрос клавиш через PlayerController (GameThread)
+### 14. НЕЛЬЗЯ выбирать материалы для 3D мешей вслепую по имени (ловушка 2D Particle/Sprite материалов)
+* **Почему:** Поиск по подстрокам `Glow`, `Light`, `FX` часто находит материалы частиц и спрайтов/биллбордов (например, `/Game/FX/Materials/M_FX_GlowLight`, использующий 2D-текстуру `T_Dot_01` для фонарей). При наложении на UV-развёртку 3D Skeletal Mesh персонажа более 95% площади меша попадает в область с `Alpha = 0.0`. Движок успешно устанавливает оверлей, но визуально в игре противники остаются абсолютно невидимыми!
+* **Как правильно:** Всегда проверять тип базового материала через распаковку/анализ `.ucas` пакетов. Для Skeletal Mesh и Static Mesh персонажей использовать материалы поверхностей геометрии (`Mesh Surface / Translucent`, например, `/Game/Materials/M_Translucent_Orange`, `/Game/Materials/M_Translucent_Red`, `/Game/Materials/M_Translucent` и т.д.). Базовый оверлейный материал должен быть рассчитан на 3D-геометрию персонажей.
+
+### 15. НЕЛЬЗЯ полагаться только на `StaticFindObject` для ассетов из паков (проблема нерезидентных объектов)
+* **Почему:** В Unreal Engine ассеты не находятся в оперативной памяти (`GUObjectArray`), пока уровень или игровой код не загрузит соответствующий пакет. Если карта не содержит объект, `StaticFindObject(path)` вернет `nil`, даже если ассет реально существует в `.ucas`/`.pak`.
+* **Как правильно:** Использовать двухступенчатый паттерн: сначала быстрый `StaticFindObject(path)`, а при `nil` — принудительный вызов `LoadAsset(path)` в GameThread с повторной проверкой `StaticFindObject(path)`:
+  ```lua
+  local function load_material(path)
+      if not path or path == "" then return nil end
+      local ok, mat = pcall(StaticFindObject, path)
+      if ok and isValid(mat) then return mat end
+
+      if LoadAsset then
+          local ok_load, loaded = pcall(LoadAsset, path)
+          if ok_load and isValid(loaded) then return loaded end
+          ok, mat = pcall(StaticFindObject, path)
+          if ok and isValid(mat) then return mat end
+      end
+      return nil
+  end
+  ```
+
+### 16. НЕЛЬЗЯ вызывать методы движка с предположением о ванильной сигнатуре без probing (проблема кастомных сборок UE)
+* **Почему:** В кастомных сборках движка (как в Far Far West UE 5.8 Shipping) сигнатуры методов расширяются разработчиками. Например, `UMeshComponent::SetOverlayMaterial` ожидает 3 параметра: `(UMaterialInterface* NewOverlayMaterial, bool bSetMaterialSlot, int32 SlotIndex)`. Вызов с 1 параметром приводит к ошибке `UFunction expected 3 parameters, received 1` на каждом меше каждый тик. А вызов с `bSetMaterialSlot = true` в цикле по слотам может ломать или затирать глобальный рендеринг оверлея.
+* **Как правильно:**
+  - Проверять сигнатуру метода (`probe_overlay_mode`) один раз при первой попытке, кэшировать результат и логировать его.
+  - Для глобального оверлея всего меша вызывать `mesh:SetOverlayMaterial(mid, false, 0)`.
+  - Применять прямой фоллбэк на свойство `mesh.OverlayMaterial = mid` с обновлением состояния рендера через переключение `mesh:SetRenderCustomDepth()`.
+
+### 17. НЕЛЬЗЯ забывать про `DepthBias` и параметры шейдера в Dynamic Material Instance
+* **Почему:** При наложении полупрозрачного оверлея поверх существующего непрозрачного меша возникает z-fighting (артефакты мерцания полигонов или невидимость оверлея внутри тела меша).
+* **Как правильно:** При инициализации DMI выставлять `DepthBias = 0.0` (если параметр есть у мастер-материала), а также передавать векторные (`Color`, `BaseColor`, `EmissiveColor`, `Tint`) и скалярные (`Intensity`, `FresnelExponent`) параметры.
+
+### 18. НЕЛЬЗЯ оставлять работу без однократной верификации в логах (One-Shot Diagnostics)
+* **Почему:** Визуальные баги в UE4SS часто работают «молча»: скрипт крутится, ошибок нет, но эффекта на экране нет.
+* **Как правильно:** Добавлять однократный диагностический лог при первой успешной регистрации/применении:
+  - `mesh:GetOverlayMaterial()` — применился ли материал на уровне C++ движка.
+  - Путь найденного базового материала при создании DMI.
+  - Статус первого опроса `IsInputKeyDown` для клавиш ввода.
+
+---
+
+## 🚀 Пошаговое руководство: Как правильно создавать новый мод для Far Far West с нуля
+
+### 1. Структура директорий мода
+Каждый мод в Far Far West должен следовать строгой структуре:
+```text
+Mods/
+  └── MyNewMod/
+        ├── enabled.txt          # Обязательно! Маркер активности мода (пустой файл)
+        ├── config.txt / .ini    # (Опционально) Конфигурация мода
+        ├── Readme.md            # Описание, клавиши, changelog
+        └── Scripts/
+              └── main.lua       # Главная точка входа скрипта
+```
+> [!IMPORTANT]
+> **Регистр путей в Linux:** Игровая папка находится на файловой системе Linux (`/mnt/steam/...`), где пути регистрозависимы. Всегда используйте точный регистр: папка `Scripts/` (с заглавной буквы) и файл `main.lua` (строчными).
+
+### 2. Регистрация в `Mods/mods.txt`
+Для загрузки мода добавьте строку в `/mnt/steam/steamapps/common/FarFarWest/FarFarWest/Binaries/Win64/ue4ss/Mods/mods.txt`:
+```text
+MyNewMod : 1
+```
+(Значение `1` — включён, `0` — выключен).
+
+### 3. Предварительная валидация синтаксиса Lua
+Перед любым тестированием в игре **всегда** проверяйте Lua-файлы локальным парсером:
+```bash
+bun x luaparse path/to/main.lua > /dev/null && echo "Syntax OK"
+```
+Ошибки синтаксиса в `main.lua` блокируют запуск мода на этапе инициализации UE4SS.
+
+### 4. Обязательная синхронизация с игрой
+Разработка ведётся в репозитории `~/Projects/FarFarWestMods/<ModName>/`. Игра читает файлы из `/mnt/steam/steamapps/common/FarFarWest/FarFarWest/Binaries/Win64/ue4ss/Mods/<ModName>/`.
+После любых правок немедленно копируйте обновлённые файлы в директорию игры:
+```bash
+cp -v ~/Projects/FarFarWestMods/<ModName>/Scripts/main.lua /mnt/steam/steamapps/common/FarFarWest/FarFarWest/Binaries/Win64/ue4ss/Mods/<ModName>/Scripts/main.lua
+```
+
+---
+
+## ✅ Золотой стандарт реализации мода UE4SS
+
+```lua
+local UEHelpers = require("UEHelpers")
+
+-- ==================== 1. БЕЗОПАСНАЯ ПРОВЕРКА ВАЛИДНОСТИ ====================
+local function isValid(obj)
+    if obj == nil then return false end
+    local ok, res = pcall(function() return obj:IsValid() end)
+    return ok and res == true
+end
+
+-- ==================== 2. БЕЗОПАСНАЯ ЗАГРУЗКА АССЕТОВ ====================
+local function load_material(path)
+    if not path or path == "" then return nil end
+    local ok, mat = pcall(StaticFindObject, path)
+    if ok and isValid(mat) then return mat end
+
+    if LoadAsset then
+        local ok_load, loaded = pcall(LoadAsset, path)
+        if ok_load and isValid(loaded) then return loaded end
+        ok, mat = pcall(StaticFindObject, path)
+        if ok and isValid(mat) then return mat end
+    end
+    return nil
+end
+
+-- ==================== 3. БЕЗОПАСНЫЙ ОПРОС КЛАВИШ (FKey.KeyName) ====================
 local function isKeyDown(pc, keyName)
     if not isValid(pc) then return false end
     -- ВАЖНО: поле структуры FKey называется KeyName, а не Key!
     local ok, pressed = pcall(function()
-        return pc:IsInputKeyDown({ KeyName = FName(keyName) })
+        return pc:IsInputKeyDown({ KeyName = UEHelpers.FindOrAddFName(keyName) })
     end)
     return ok and pressed == true
 end
 
--- 3. Очистка кэша при смене уровней
+-- ==================== 4. БЕЗОПАСНЫЙ SET OVERLAY MATERIAL ====================
+local overlayMode = nil -- "m3" = (mat, false, 0), "m1" = (mat), "prop" = mesh.OverlayMaterial
+local function apply_overlay_to_mesh(mesh, material)
+    if not isValid(mesh) or not isValid(material) then return end
+
+    -- Отключаем дистанционный куллинг оверлея
+    pcall(function() mesh:SetOverlayMaterialMaxDrawDistance(0.0) end)
+
+    if overlayMode == nil then
+        if pcall(function() mesh:SetOverlayMaterial(material, false, 0) end) then
+            overlayMode = "m3"
+        elseif pcall(function() mesh:SetOverlayMaterial(material) end) then
+            overlayMode = "m1"
+        else
+            overlayMode = "prop"
+        end
+    end
+
+    if overlayMode == "m3" then
+        mesh:SetOverlayMaterial(material, false, 0)
+    elseif overlayMode == "m1" then
+        mesh:SetOverlayMaterial(material)
+    else
+        mesh.OverlayMaterial = material
+        pcall(function()
+            local cur = mesh.bRenderCustomDepth
+            mesh:SetRenderCustomDepth(not cur)
+            mesh:SetRenderCustomDepth(cur)
+        end)
+    end
+end
+
+-- ==================== 5. ОЧИСТКА КЭША ПРИ СМЕНЕ УРОВНЕЙ ====================
 RegisterLoadMapPostHook(function()
     cachedPlayer = nil
     cachedPC = nil
@@ -136,13 +277,12 @@ RegisterLoadMapPostHook(function()
     activeTrackedObjects = {}
 end)
 
--- 4. Безопасный цикл в GameThread с защитой pcall
+-- ==================== 6. БЕЗОПАСНЫЙ ЦИКЛ В GAMETHREAD ====================
 if LoopInGameThreadWithDelay then
     LoopInGameThreadWithDelay(50, function()
         pcall(myTickFunction)
     end)
 else
-    -- Резервный фолбэк для старых версий
     LoopAsync(50, function()
         ExecuteInGameThread(function()
             pcall(myTickFunction)
