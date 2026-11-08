@@ -1,5 +1,5 @@
 -- ==============================================================================
--- EnemyHighlights v1.0.1
+-- EnemyHighlights v1.0.2
 -- Warframe-style Fresnel Rim Glow on Enemies (Client-Side, Depth-Tested)
 --
 -- Features:
@@ -9,9 +9,8 @@
 --   - Aimed-part & target acquisition overlay: dynamically recolors aimed enemy or
 --     aimed body part / weakspot under your crosshair for instant visual feedback
 --   - Live configuration reload (F7) and instant toggle (F8) without restarting
---   - v1.0.1: Full GameThread synchronization (LoopInGameThreadWithDelay),
---     robust pcall-protected isValid checks, and deferred construction handling
---     to eliminate multithreaded Lua state corruption and crashes.
+--   - v1.0.2: Universal Character/Pawn scanning and native NotifyOnNewObject hook
+--     covering all game enemy subclasses (BP_Enemy_*), with TArray compatibility.
 -- ==============================================================================
 
 local UEHelpers = require("UEHelpers")
@@ -302,6 +301,39 @@ local function get_enemy_tier(actor)
     return "Regular"
 end
 
+local function is_enemy_actor(actor)
+    if not isValid(actor) then return false end
+
+    local ok_fn, full_name = pcall(function() return actor:GetFullName() end)
+    if not ok_fn or not full_name then return false end
+
+    -- Filter out Class Default Objects
+    if full_name:find("Default__", 1, true) then return false end
+
+    -- Filter out player
+    if full_name:find("BP_Player", 1, true) or full_name:find("Player", 1, true) then
+        return false
+    end
+
+    -- Filter out friendly NPCs
+    if full_name:find("BP_NPC", 1, true) then
+        return false
+    end
+
+    -- All enemies in Far Far West start with BP_Enemy (e.g. BP_Enemy_Cryptic_Grunt_C)
+    if full_name:find("BP_Enemy", 1, true) then
+        -- Exclude non-character entities such as projectiles and proxies
+        if full_name:find("Projectile", 1, true)
+            or full_name:find("Proxy", 1, true)
+            or full_name:find("Spawner", 1, true) then
+            return false
+        end
+        return true
+    end
+
+    return false
+end
+
 local function collect_actor_meshes(actor)
     local meshes = {}
     local seen = {}
@@ -313,22 +345,54 @@ local function collect_actor_meshes(actor)
         pcall(function() seen[tostring(char_mesh:GetAddress())] = true end)
     end
 
+    -- Also check RootComponent in case actor has mesh as RootComponent
+    pcall(function()
+        local root = actor.RootComponent
+        if isValid(root) then
+            local ok_sm, is_sm = pcall(function() return root:IsA(StaticFindObject("/Script/Engine.MeshComponent")) end)
+            if ok_sm and is_sm then
+                local addr = tostring(root:GetAddress())
+                if not seen[addr] then
+                    table.insert(meshes, root)
+                    seen[addr] = true
+                end
+            end
+        end
+    end)
+
     -- Query any attached MeshComponents (shields, armor, weakpoint parts)
     pcall(function()
         local static_mesh_class = StaticFindObject("/Script/Engine.MeshComponent")
         if isValid(static_mesh_class) then
             local comps = actor:K2_GetComponentsByClass(static_mesh_class)
             if comps then
-                for i = 1, #comps do
-                    local comp = comps[i]
-                    if isValid(comp) then
-                        local addr_str = tostring(comp:GetAddress())
-                        if not seen[addr_str] then
-                            local is_visible = true
-                            pcall(function() is_visible = comp:IsVisible() end)
-                            if is_visible then
-                                table.insert(meshes, comp)
-                                seen[addr_str] = true
+                if comps.ForEach then
+                    comps:ForEach(function(index, elem)
+                        local comp = elem and elem:get()
+                        if isValid(comp) then
+                            local ok_addr, addr_str = pcall(function() return tostring(comp:GetAddress()) end)
+                            if ok_addr and addr_str and not seen[addr_str] then
+                                local is_visible = true
+                                pcall(function() is_visible = comp:IsVisible() end)
+                                if is_visible then
+                                    table.insert(meshes, comp)
+                                    seen[addr_str] = true
+                                end
+                            end
+                        end
+                    end)
+                else
+                    for i = 1, #comps do
+                        local comp = comps[i]
+                        if isValid(comp) then
+                            local ok_addr, addr_str = pcall(function() return tostring(comp:GetAddress()) end)
+                            if ok_addr and addr_str and not seen[addr_str] then
+                                local is_visible = true
+                                pcall(function() is_visible = comp:IsVisible() end)
+                                if is_visible then
+                                    table.insert(meshes, comp)
+                                    seen[addr_str] = true
+                                end
                             end
                         end
                     end
@@ -351,9 +415,12 @@ end
 
 local function apply_highlight_to_mesh(mesh, mid)
     if not isValid(mesh) or not isValid(mid) then return end
-    pcall(function()
+    local ok, err = pcall(function()
         mesh:SetOverlayMaterial(mid)
     end)
+    if not ok then
+        LogWarn(string.format("Failed to SetOverlayMaterial on mesh: %s", tostring(err)))
+    end
 end
 
 local function remove_highlight_from_mesh(mesh, original_native_overlay)
@@ -399,6 +466,8 @@ local function register_enemy(actor)
             apply_highlight_to_mesh(m, mid)
         end
     end
+
+    LogInfo(string.format("Enemy registered: %s (Tier: %s, Meshes: %d)", actor:GetFullName(), tier, #meshes))
 end
 
 local function unregister_enemy(addr)
@@ -425,6 +494,12 @@ end
 
 local function is_enemy_alive(actor)
     if not isValid(actor) then return false end
+
+    -- Check if being destroyed
+    local ok_dest, being_destroyed = pcall(function() return actor:IsActorBeingDestroyed() end)
+    if ok_dest and being_destroyed then
+        return false
+    end
 
     -- Check Health property if present
     local ok_hp, hp = pcall(function() return actor.Health end)
@@ -602,15 +677,32 @@ local function scan_and_update_enemies()
         refresh_all_materials()
     end
 
-    -- 1. Scan for all enemy instances in the level
-    local found_enemies = nil
-    pcall(function() found_enemies = FindAllOf("BP_Enemy_C") end)
-    for _, enemy in ipairs(found_enemies or {}) do
-        if isValid(enemy) then
-            local ok_fn, name = pcall(function() return enemy:GetFullName() end)
-            if ok_fn and name and not name:find("Default__", 1, true) then
-                register_enemy(enemy)
+    -- 1. Scan for all enemy instances in the level (Characters and Pawns)
+    local candidates = {}
+    local seen_cand = {}
+
+    local function add_candidates(list)
+        if not list then return end
+        for _, obj in ipairs(list) do
+            if isValid(obj) then
+                local ok_a, a = pcall(function() return tostring(obj:GetAddress()) end)
+                if ok_a and a and not seen_cand[a] then
+                    seen_cand[a] = true
+                    table.insert(candidates, obj)
+                end
             end
+        end
+    end
+
+    local ok_chars, chars = pcall(function() return FindAllOf("Character") end)
+    if ok_chars and chars then add_candidates(chars) end
+
+    local ok_pawns, pawns = pcall(function() return FindAllOf("Pawn") end)
+    if ok_pawns and pawns then add_candidates(pawns) end
+
+    for _, cand in ipairs(candidates) do
+        if is_enemy_actor(cand) then
+            register_enemy(cand)
         end
     end
 
@@ -707,7 +799,7 @@ end
 
 -- ==================== INITIALIZATION & HOOKS ====================
 local function init_mod()
-    LogInfo("Initializing EnemyHighlights v1.0.1 (GameThread Synchronized)...")
+    LogInfo("Initializing EnemyHighlights v1.0.2 (GameThread Synchronized)...")
 
     -- Load configuration
     load_config()
@@ -720,24 +812,21 @@ local function init_mod()
     RegisterKeyBind(reload_key, reload_config)
     LogInfo(string.format("Keybinds registered: [%s] Toggle, [%s] Reload Config", Config.ToggleKey, Config.ReloadConfigKey))
 
-    -- Deferred registration on enemy construction to allow BeginPlay to finish safely
-    NotifyOnNewObject("/Game/Enemies/BP_Enemy.BP_Enemy_C", function(new_enemy)
-        if isValid(new_enemy) then
-            local ok, name = pcall(function() return new_enemy:GetFullName() end)
-            if ok and name and not name:find("Default__", 1, true) then
-                if ExecuteInGameThreadWithDelay then
-                    ExecuteInGameThreadWithDelay(150, function()
-                        if isValid(new_enemy) then
-                            pcall(function() register_enemy(new_enemy) end)
-                        end
-                    end)
-                else
-                    ExecuteInGameThread(function()
-                        if isValid(new_enemy) then
-                            pcall(function() register_enemy(new_enemy) end)
-                        end
-                    end)
-                end
+    -- Native Character construction hook for zero-latency detection
+    NotifyOnNewObject("/Script/Engine.Character", function(new_char)
+        if isValid(new_char) then
+            if ExecuteInGameThreadWithDelay then
+                ExecuteInGameThreadWithDelay(150, function()
+                    if isValid(new_char) and is_enemy_actor(new_char) then
+                        pcall(function() register_enemy(new_char) end)
+                    end
+                end)
+            else
+                ExecuteInGameThread(function()
+                    if isValid(new_char) and is_enemy_actor(new_char) then
+                        pcall(function() register_enemy(new_char) end)
+                    end
+                end)
             end
         end
     end)
@@ -777,7 +866,7 @@ local function init_mod()
         end)
     end
 
-    LogInfo("EnemyHighlights v1.0.1 initialized and active! Ready to hunt.")
+    LogInfo("EnemyHighlights v1.0.2 initialized and active! Ready to hunt.")
 end
 
 -- Run initialization
