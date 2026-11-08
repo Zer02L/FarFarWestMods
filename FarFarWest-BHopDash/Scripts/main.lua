@@ -1,13 +1,24 @@
 --[[
-    BHopDash Enhanced v13.0 for Far Far West
+    BHopDash Enhanced v14.0 for Far Far West
     UE4SS 3.0.x Lua Mod
 
-    Key improvements in v13.0:
-    - Hold-to-BHop: Auto-bhop works strictly while Spacebar is held down.
-    - Immediate stop on release: Releasing Space immediately stops bhopping on landing.
-    - Single tap produces a single normal jump.
-    - No artificial timer extension on landing (bhopActiveUntil loop removed).
-    - Prevents double-execution on landing frames.
+    Key improvements in v14.0:
+    - REAL hold detection: UE4SS RegisterKeyBind is edge-triggered (it fires once
+      per physical press and never again while the key is held, because OS
+      key-repeat is ignored). The old press-time-window heuristic therefore
+      reported spaceHeld=false on EVERY landing and hold-to-bhop never worked.
+      v14.0 polls the game's own input state via
+      APlayerController::IsInputKeyDown(FKey) inside the GameThread loop and
+      falls back to the old window heuristic if that API is unavailable.
+    - Short 0.10s "fresh press" grace so a press that happens on the very same
+      frame as a landing is never missed (input processing latency).
+    - Automatic self-check: if polling never sees a key that was physically
+      pressed, the mod logs a warning and falls back instead of silently
+      breaking hold-to-bhop.
+
+    Retained from v13.0:
+    - Immediate stop on release, single tap = single jump.
+    - No artificial timer extension on landing.
     - Thread-safe input handling with watchdog-protected async tick loop.
 --]]
 
@@ -16,7 +27,7 @@ local UEHelpers = require("UEHelpers")
 local config = {
     ENABLED = true,
     ALWAYS_BHOP = false,             -- If false, holding Space continues hopping; if true, hops on every landing
-    SPACE_HOLD_WINDOW = 0.30,        -- Seconds window to consider key currently held (OS key-repeat interval)
+    SPACE_HOLD_WINDOW = 0.30,        -- Fallback only: press-window used when IsInputKeyDown polling is unavailable
     AUTO_DASH_ENABLED = true,
     AUTO_JUMP_AFTER_DASH = true,
     RESET_DASH_COOLDOWN = true,
@@ -42,6 +53,18 @@ local lastShiftPressTime = 0.0
 local spaceTriggerRequested = false
 local shiftTriggerRequested = false
 local jumpCounter = 0
+
+-- Live input polling state (GameThread only)
+-- variant: 0 = not probed yet, 1/2 = working call form, 3 = disabled (API missing)
+-- suspended: API works but has not yet proven it sees real presses (self-check)
+local inputPoll = {
+    variant = 0,
+    fails = 0,
+    warned = false,
+    suspended = false,
+}
+local spacePollState = { lastTrue = 0.0, checkedAt = 0.0, misses = 0 }
+local shiftPollState = { lastTrue = 0.0, checkedAt = 0.0, misses = 0 }
 
 local function log(msg)
     print("[BHopDash] " .. tostring(msg))
@@ -103,6 +126,93 @@ local function isValid(obj)
     if obj == nil then return false end
     local ok, res = pcall(function() return obj:IsValid() end)
     return ok and res == true
+end
+
+-- ==================== Real key-held polling (v14.0) ====================
+-- UE4SS RegisterKeyBind is edge-triggered: it fires once per physical press and
+-- never again while the key stays down (OS key-repeat is not re-delivered), so a
+-- press-time window can never represent "currently held". We instead ask the game
+-- itself: APlayerController::IsInputKeyDown(FKey Key) is BlueprintCallable and
+-- reflects the exact key state the game is processing right now.
+local function tryInputKeyDown(pc, variant, keyName)
+    if variant == 1 then
+        return pc:IsInputKeyDown({ Key = FName(keyName) })
+    end
+    return pc:IsInputKeyDown({ Key = keyName })
+end
+
+-- Returns the live held-state of `keyName`.
+-- If polling is unavailable (API missing / unexpected parameter encoding) it
+-- returns `fallback` (the legacy press-window heuristic) and, after repeated
+-- failures, permanently disables polling so we never spam errors.
+-- `edgeTime` is the timestamp of the last physical press; it drives a self-check
+-- that catches a poll which runs fine but always reports false.
+local function pollKeyHeld(pc, keyName, fallback, edgeTime, st)
+    if inputPoll.variant == 3 then
+        return fallback
+    end
+
+    local got = nil
+    local lastErr = nil
+
+    if inputPoll.variant == 0 then
+        for _, v in ipairs({ 1, 2 }) do
+            local ok, res = pcall(tryInputKeyDown, pc, v, keyName)
+            if ok and type(res) == "boolean" then
+                inputPoll.variant = v
+                got = res
+                break
+            end
+            lastErr = res
+        end
+    else
+        local ok, res = pcall(tryInputKeyDown, pc, inputPoll.variant, keyName)
+        if ok and type(res) == "boolean" then
+            got = res
+        else
+            lastErr = res
+        end
+    end
+
+    if got == nil then
+        inputPoll.fails = inputPoll.fails + 1
+        if not inputPoll.warned then
+            inputPoll.warned = true
+            log("IsInputKeyDown probe failed (will retry): " .. tostring(lastErr))
+        end
+        if inputPoll.fails >= 100 then
+            inputPoll.variant = 3
+            log("IsInputKeyDown unavailable - using press-window fallback: " .. tostring(lastErr))
+        end
+        return fallback
+    end
+
+    local now = os.clock()
+    if got then
+        -- Proof of life: polling sees a real held key, so all suspicion is cleared
+        st.lastTrue = now
+        st.misses = 0
+        if inputPoll.suspended then
+            inputPoll.suspended = false
+            log("IsInputKeyDown polling recovered.")
+        end
+    elseif edgeTime and edgeTime > st.checkedAt and (now - edgeTime) > 0.5 then
+        -- Self-check: once a press edge is older than 0.5s, polling must have seen
+        -- that key as held at least once, otherwise this poll path looks dead.
+        st.checkedAt = edgeTime
+        if st.lastTrue < edgeTime then
+            st.misses = st.misses + 1
+            if st.misses >= 3 and not inputPoll.suspended then
+                inputPoll.suspended = true
+                log("IsInputKeyDown never saw the pressed key - using press-window fallback until polling proves alive.")
+            end
+        end
+    end
+
+    if inputPoll.suspended and not got then
+        return fallback
+    end
+    return got
 end
 
 local function acquirePlayer()
@@ -231,8 +341,18 @@ local function gameThreadTick()
     local inAir = isFalling or (not isGrounded)
     local now = os.clock()
 
-    local spaceHeld = (now - lastSpacePressTime <= config.SPACE_HOLD_WINDOW)
-    local shiftHeld = (now - lastShiftPressTime <= config.SPACE_HOLD_WINDOW)
+    -- Legacy press-window values (used as fallback and as a 0.10s fresh-press grace)
+    local spaceWindow = (now - lastSpacePressTime <= config.SPACE_HOLD_WINDOW)
+    local shiftWindow = (now - lastShiftPressTime <= config.SPACE_HOLD_WINDOW)
+    local spaceFresh = (now - lastSpacePressTime <= 0.10)
+    local shiftFresh = (now - lastShiftPressTime <= 0.10)
+
+    -- Live held-state from the game's input system (fallback = press-window)
+    local spaceHeld = spaceFresh
+        or pollKeyHeld(cachedPC, "SpaceBar", spaceWindow, lastSpacePressTime, spacePollState)
+    local shiftHeld = shiftFresh
+        or pollKeyHeld(cachedPC, "LeftShift", shiftWindow, lastShiftPressTime, shiftPollState)
+
     local isBhopActive = config.ALWAYS_BHOP or spaceHeld
     local isDashActive = shiftHeld
 
@@ -274,8 +394,14 @@ local function gameThreadTick()
     -- Heartbeat log every 10 seconds in debug mode to confirm loop health
     if config.DEBUG and (now - lastHeartbeat >= 10.0) then
         lastHeartbeat = now
-        log(string.format("Heartbeat: active, grounded=%s, inAir=%s, spaceHeld=%s",
-            tostring(isGrounded), tostring(inAir), tostring(spaceHeld)))
+        local probeStatus = "poll:v" .. tostring(inputPoll.variant)
+        if inputPoll.variant == 3 then
+            probeStatus = "fallback"
+        elseif inputPoll.suspended then
+            probeStatus = "suspended"
+        end
+        log(string.format("Heartbeat: active, grounded=%s, inAir=%s, spaceHeld=%s, shiftHeld=%s, input=%s",
+            tostring(isGrounded), tostring(inAir), tostring(spaceHeld), tostring(shiftHeld), probeStatus))
     end
 end
 
@@ -310,7 +436,7 @@ loadConfig()
 RegisterKeyBind(Key.SPACE, onSpaceKeyPressed)
 RegisterKeyBind(Key.LEFT_SHIFT or 0x10, onShiftKeyPressed)
 
-log("BHopDash v13.1 initialized! Hold-to-BHop mode active (GameThread synchronized).")
+log("BHopDash v14.0 initialized! Hold-to-BHop with live IsInputKeyDown polling (GameThread synchronized).")
 if LoopInGameThreadWithDelay then
     LoopInGameThreadWithDelay(config.POLL_MS, function()
         pcall(gameThreadTick)

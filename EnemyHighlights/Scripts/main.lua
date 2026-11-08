@@ -432,64 +432,156 @@ local function get_tier_mid(tier)
     return MIDs.Regular
 end
 
+-- ==================== SetOverlayMaterial signature handling ====================
+-- The signature of SetOverlayMaterial differs between engine builds (1 parameter
+-- in stock UE, 3 parameters in this build). Calling it with the wrong argument
+-- count makes UE4SS raise a Lua error for EVERY mesh of EVERY scan tick, which
+-- both spams the log and stresses the Lua/UE4SS error path, so the working call
+-- form is probed ONCE and cached.
+-- mode: nil = unprobed, "m3" = (mat,false,0), "m1" = (mat),
+--       "s3" = per-slot (mat,true,slot) only, "prop" = property assignment only
+local overlayMode = nil
+
+-- Rebuild the render proxy so a plain property assignment is actually visible
+-- (SetOverlayMaterial normally calls MarkRenderStateDirty() for us).
+local function force_render_state_rebuild(mesh)
+    pcall(function()
+        local cur = mesh.bRenderCustomDepth
+        mesh:SetRenderCustomDepth(not cur)
+        mesh:SetRenderCustomDepth(cur)
+    end)
+end
+
+-- Property-assignment path with change detection: rebuilding the render proxy is
+-- expensive, so only force it when the overlay material actually changed.
+local function set_overlay_property(mesh, material)
+    local changed = true
+    pcall(function()
+        local cur = mesh.OverlayMaterial
+        local curValid = isValid(cur)
+        local newValid = isValid(material)
+        if curValid and newValid then
+            local ok1, a1 = pcall(function() return tostring(cur:GetAddress()) end)
+            local ok2, a2 = pcall(function() return tostring(material:GetAddress()) end)
+            changed = not (ok1 and ok2 and a1 == a2)
+        else
+            changed = curValid or newValid
+        end
+    end)
+    if not changed then return end
+    pcall(function()
+        mesh.OverlayMaterial = material
+    end)
+    force_render_state_rebuild(mesh)
+end
+
+local function probe_overlay_mode(mesh, mid)
+    if pcall(function() mesh:SetOverlayMaterial(mid, false, 0) end) then
+        return "m3"
+    end
+    if pcall(function() mesh:SetOverlayMaterial(mid) end) then
+        return "m1"
+    end
+    if pcall(function() mesh:SetOverlayMaterial(mid, true, 0) end) then
+        return "s3"
+    end
+    return "prop"
+end
+
+local function get_overlay_mode(mesh, mid)
+    if overlayMode == nil then
+        overlayMode = probe_overlay_mode(mesh, mid)
+        LogInfo(string.format("SetOverlayMaterial signature probe result: %s", overlayMode))
+    end
+    return overlayMode
+end
+
 local function apply_highlight_to_mesh(mesh, mid)
     if not isValid(mesh) or not isValid(mid) then return end
-    -- 1. UE 5.1+ Global Mesh Overlay
-    local ok = pcall(function()
-        mesh:SetOverlayMaterial(mid, false, 0)
-    end)
-    if not ok then
+    local mode = get_overlay_mode(mesh, mid)
+
+    if mode == "m3" then
+        if not pcall(function() mesh:SetOverlayMaterial(mid, false, 0) end) then
+            set_overlay_property(mesh, mid)
+            return
+        end
+        -- Per-slot overlay pass (ensures visibility on meshes that render per-slot overlays)
         pcall(function()
-            mesh:SetOverlayMaterial(mid)
+            local num_mats = mesh:GetNumMaterials()
+            if num_mats and num_mats > 0 then
+                for i = 0, num_mats - 1 do
+                    pcall(function()
+                        mesh:SetOverlayMaterial(mid, true, i)
+                    end)
+                end
+            end
+        end)
+    elseif mode == "m1" then
+        if not pcall(function() mesh:SetOverlayMaterial(mid) end) then
+            set_overlay_property(mesh, mid)
+        end
+    elseif mode == "s3" then
+        pcall(function()
+            local num_mats = mesh:GetNumMaterials()
+            if num_mats and num_mats > 0 then
+                for i = 0, num_mats - 1 do
+                    pcall(function()
+                        mesh:SetOverlayMaterial(mid, true, i)
+                    end)
+                end
+            end
         end)
     end
 
-    -- 2. Material slot overlay pass (ensures visibility on meshes that render per-slot overlays)
-    pcall(function()
-        local num_mats = mesh:GetNumMaterials()
-        if num_mats and num_mats > 0 then
-            for i = 0, num_mats - 1 do
-                pcall(function()
-                    mesh:SetOverlayMaterial(mid, true, i)
-                end)
-            end
-        end
-    end)
-
-    -- 3. Direct UProperty assignment fallback
-    pcall(function()
-        mesh.OverlayMaterial = mid
-    end)
+    if mode == "prop" then
+        -- Direct UProperty assignment fallback + forced proxy rebuild
+        set_overlay_property(mesh, mid)
+    end
 end
 
 local function remove_highlight_from_mesh(mesh, original_native_overlay)
     if not isValid(mesh) then return end
-    -- Clear global overlay
-    local ok = pcall(function()
-        mesh:SetOverlayMaterial(original_native_overlay or nil, false, 0)
-    end)
-    if not ok then
+    local mode = overlayMode or "prop"
+    local target = original_native_overlay
+
+    if mode == "m3" then
+        if not pcall(function() mesh:SetOverlayMaterial(target, false, 0) end) then
+            if target == nil then
+                set_overlay_property(mesh, nil)
+            end
+            return
+        end
         pcall(function()
-            mesh:SetOverlayMaterial(original_native_overlay or nil)
+            local num_mats = mesh:GetNumMaterials()
+            if num_mats and num_mats > 0 then
+                for i = 0, num_mats - 1 do
+                    pcall(function()
+                        mesh:SetOverlayMaterial(target, true, i)
+                    end)
+                end
+            end
+        end)
+    elseif mode == "m1" then
+        if not pcall(function() mesh:SetOverlayMaterial(target) end) then
+            if target == nil then
+                set_overlay_property(mesh, nil)
+            end
+        end
+    elseif mode == "s3" then
+        pcall(function()
+            local num_mats = mesh:GetNumMaterials()
+            if num_mats and num_mats > 0 then
+                for i = 0, num_mats - 1 do
+                    pcall(function()
+                        mesh:SetOverlayMaterial(target, true, i)
+                    end)
+                end
+            end
         end)
     end
 
-    -- Clear all material slots
-    pcall(function()
-        local num_mats = mesh:GetNumMaterials()
-        if num_mats and num_mats > 0 then
-            for i = 0, num_mats - 1 do
-                pcall(function()
-                    mesh:SetOverlayMaterial(nil, true, i)
-                end)
-            end
-        end
-    end)
-
-    if original_native_overlay == nil then
-        pcall(function()
-            mesh.OverlayMaterial = nil
-        end)
+    if mode == "prop" and target == nil then
+        set_overlay_property(mesh, nil)
     end
 end
 
