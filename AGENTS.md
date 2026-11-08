@@ -1,6 +1,6 @@
 # Rules for AI Agents: UE4SS Lua Modding & Stability Guidelines
 
-These rules are mandatory for any AI agent creating, editing, or debugging UE4SS Lua mods for **Far Far West** (and any Unreal Engine 4/5 game using UE4SS). Violating these rules causes game freezes, memory corruption, memory leaks, and fatal crashes (`0xc0000005 EXCEPTION_ACCESS_VIOLATION`).
+These rules are mandatory for any AI agent creating, editing, or debugging UE4SS Lua mods for **Far Far West** (and any Unreal Engine 4/5 game using UE4SS). Violating these rules causes game freezes, silent logic failures, memory corruption, memory leaks, and fatal crashes (`0xc0000005 EXCEPTION_ACCESS_VIOLATION`).
 
 ---
 
@@ -32,7 +32,40 @@ These rules are mandatory for any AI agent creating, editing, or debugging UE4SS
   3. Регулярно очищать таблицы от неживых врагов/актеров (`ActiveEnemies[addr] = nil`).
   4. При смене карты (`RegisterLoadMapPostHook`) **обязательно полностью очищать** все кэши (`ActiveEnemies = {}`, `cachedPawn = nil`, `cachedPC = nil`).
 
-### 4. НЕЛЬЗЯ трогать компоненты и материалы актера внутри `NotifyOnNewObject`
+### 4. НЕЛЬЗЯ путать имена параметров UFunction с именами полей структуры (`convert_lua_table_to_struct`)
+* **Почему:** В UE4SS при передаче таблицы Lua в качестве UStruct-аргумента (`convert_lua_table_to_struct` в `LuaUObject.cpp`) маппинг полей происходит **по именам отражённых полей самой структуры (UStruct)**, а **НЕ** по имени параметра в сигнатуре функции!
+  - Неизвестные ключи таблицы **молча игнорируются** движком без ошибки Lua и без предупреждения в лог.
+  - *Классическая ошибка:* в `APlayerController::IsInputKeyDown(Key)` имя параметра — `Key`, но тип параметра — `struct FKey`. У `FKey` единственное отражённое поле называется **`KeyName`** (тип `FName`). Передача `{ Key = FName("SpaceBar") }` молча игнорируется: игра получает пустой ключ `None`, функция всегда возвращает `false`, а `pcall` завершается с успехом (`ok == true`).
+* **Как правильно:** Передавать поля строго в соответствии с именами членов C++ структуры:
+  ```lua
+  -- Для FKey (единственное поле KeyName):
+  pc:IsInputKeyDown({ KeyName = FName("SpaceBar") })
+
+  -- Для FVector:
+  { X = 0.0, Y = 0.0, Z = 100.0 }
+
+  -- Для FRotator:
+  { Pitch = 0.0, Yaw = 90.0, Roll = 0.0 }
+
+  -- Для FLinearColor:
+  { R = 1.0, G = 0.5, B = 0.0, A = 1.0 }
+  ```
+
+### 5. НЕЛЬЗЯ полагаться на `RegisterKeyBind` для удержания клавиш (Hold-действий)
+* **Почему:** `RegisterKeyBind` в UE4SS является **edge-triggered** (событие физического нажатия), а не level-triggered (состояние зажатия). Эвристики «временных окон» (`now - lastPress < threshold`) неизбежно сбоят при длительных прыжках/дэшах: в момент приземления окно истекает (`spaceHeld == false`), и распрыжка прерывается.
+* **Как правильно:**
+  - Для непрерывных действий (Bhop, Dash hold, приседания) опрашивать `PlayerController:IsInputKeyDown({ KeyName = FName(keyName) })` синхронно в GameThread цикле (`LoopInGameThreadWithDelay`).
+  - Добавлять self-check / watchdog (если за N циклов статус клавиши подозрительно завис или не отвечает — fallback или предупреждение).
+  - Делать **однократный лог первого результата опроса** (`one-shot log`), чтобы по `UE4SS.log` сразу видеть: движок получает корректное состояние клавиши или нет.
+
+### 6. НЕЛЬЗЯ делать слепой probe сигнатур, если ошибочный вариант «проглатывается» без ошибки
+* **Почему:** Если метод или функция движка молча игнорирует неверные параметры (как в случае с полями структур выше), слепой probe с перебором вариантов (`ok, res = pcall(variant1); if not ok then ...`) посчитает нерабочий вариант успешным (`ok == true`), выберет мёртвую ветку и мод будет вечно работать вхолостую.
+* **Как правильно:**
+  - Проводить probe конкретной сигнатуры с проверкой не только факта вызова (`ok`), но и валидности возвращённого значения / реального эффекта.
+  - Если probe завершился неудачно — переводить подсистему в явное состояние `disabled`/`suspended` с записью в лог, а не маскировать под дефолтный `false`.
+  - Кэшировать найденную сигнатуру один раз при старте или первом вызове.
+
+### 7. НЕЛЬЗЯ трогать компоненты и материалы актера внутри `NotifyOnNewObject`
 * **Почему:** `NotifyOnNewObject` срабатывает в момент работы конструктора объекта (`StaticConstructObject_Internal`), когда актер еще не закончил инициализацию: компоненты не зарегистрированы, свойства не выставлены, `BeginPlay` не сработал.
 * **Как правильно:** Откладывайте регистрацию на 100–200 мс с помощью `ExecuteInGameThreadWithDelay`:
   ```lua
@@ -47,17 +80,29 @@ These rules are mandatory for any AI agent creating, editing, or debugging UE4SS
   end)
   ```
 
-### 5. НЕЛЬЗЯ создавать Dynamic Material Instances (`CreateDynamicMaterialInstance`) в тике
+### 8. НЕЛЬЗЯ создавать Dynamic Material Instances (`CreateDynamicMaterialInstance`) в тике
 * **Почему:** Каждый вызов `CreateDynamicMaterialInstance` выделяет новый UObject в памяти движка. Создание материалов каждый кадр или секунду быстро забивает память, приводит к микрофризам GC и падению по нехватке памяти (OOM).
 * **Как правильно:** Создавать материал **один раз** при загрузке карты/инициализации мода, кэшировать его в таблице `MIDs` и применять один и тот же инстанс ко всем мешам.
 
-### 6. НЕЛЬЗЯ спамить `ExecuteInGameThread` без троттлинга
+### 9. НЕЛЬЗЯ забывать про дистанционный куллинг Overlay-материалов
+* **Почему:** При использовании `SetOverlayMaterial` движок Unreal Engine по умолчанию может применять дистанционный куллинг (`OverlayMaterialMaxDrawDistance`), из-за чего подсветка (ESP, Glow, Highlights) внезапно исчезает при отдалении от объекта.
+* **Как правильно:** Принудительно отключать куллинг оверлея: `mesh:SetOverlayMaterialMaxDrawDistance(0.0)`.
+
+### 10. НЕЛЬЗЯ спамить `ExecuteInGameThread` без троттлинга
 * **Почему:** Если быстрый таймер (например, каждые 5-10 мс) ставит задачи в очередь `ExecuteInGameThread`, а игра просела по FPS, очередь переполняется, вызывая огромные задержки и зависания.
 * **Как правильно:** Использовать флаги занятости (`gameTickQueued`) или переходить на `LoopInGameThreadWithDelay`, который сам управляет интервалом между вызовами.
 
-### 7. НЕЛЬЗЯ забывать синхронизировать изменения между репозиторием и папкой игры
+### 11. Опасность нативных DLL: `mods.txt` НЕ выключает `.dll`!
+* **Почему:** В UE4SS файлы нативных библиотек `Mods/<ModName>/dlls/main.dll` загружаются загрузчиком движка **безусловно**, даже если мод помечен как `0` (отключен) в `mods.txt`! Если в папке осталась старая или отладочная DLL, она продолжит выполняться и конфликтовать с Lua-скриптами.
+* **Как правильно:** Чтобы гарантированно отключить нативную DLL, переименовывать её (например, в `main.dll.disabled`) или удалять из каталога `dlls/`.
+
+### 12. НЕЛЬЗЯ забывать синхронизировать изменения между репозиторием и папкой игры
 * **Почему:** Репозиторий находится в `~/Projects/FarFarWestMods/`, а игра читает моды из `/mnt/steam/steamapps/common/FarFarWest/FarFarWest/Binaries/Win64/ue4ss/Mods/`. Редактирование только одного места приводит к рассинхронизации.
-* **Как правильно:** Всегда обновлять оба расположения и проверять синтаксис Lua (`bun x luaparse`) перед запуском.
+* **Как правильно:** Всегда обновлять оба расположения и проверять синтаксис Lua (`bun x luaparse <file>`) перед запуском.
+
+### 13. Правила коммитов и работы в терминале
+* **Conventional Commits:** Репозиторий использует pre-commit hook, требующий строгий формат: `type(scope): description` (например, `fix(bhopdash): pass FKey as KeyName field to IsInputKeyDown`). Допустимые типы: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+* **Экранирование в shell:** Не используйте обратные кавычки (backticks) внутри строк с двойными кавычками `git commit -m "..."`, иначе bash попытается выполнить содержимое кавычек как команду (`KeyName: command not found`). Всегда оборачивайте сообщения коммитов в одинарные кавычки: `git commit -m 'type(scope): description'`.
 
 ---
 
@@ -66,21 +111,32 @@ These rules are mandatory for any AI agent creating, editing, or debugging UE4SS
 ```lua
 local UEHelpers = require("UEHelpers")
 
--- 1. Безопасная проверка UObject
+-- 1. Безопасная проверка валидности UObject
 local function isValid(obj)
     if obj == nil then return false end
     local ok, res = pcall(function() return obj:IsValid() end)
     return ok and res == true
 end
 
--- 2. Очистка кэша при смене уровней
+-- 2. Безопасный опрос клавиш через PlayerController (GameThread)
+local function isKeyDown(pc, keyName)
+    if not isValid(pc) then return false end
+    -- ВАЖНО: поле структуры FKey называется KeyName, а не Key!
+    local ok, pressed = pcall(function()
+        return pc:IsInputKeyDown({ KeyName = FName(keyName) })
+    end)
+    return ok and pressed == true
+end
+
+-- 3. Очистка кэша при смене уровней
 RegisterLoadMapPostHook(function()
     cachedPlayer = nil
+    cachedPC = nil
     cachedWorld = nil
     activeTrackedObjects = {}
 end)
 
--- 3. Безопасный цикл в GameThread
+-- 4. Безопасный цикл в GameThread с защитой pcall
 if LoopInGameThreadWithDelay then
     LoopInGameThreadWithDelay(50, function()
         pcall(myTickFunction)
