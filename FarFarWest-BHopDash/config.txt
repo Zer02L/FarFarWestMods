@@ -1,23 +1,18 @@
-# BHopDash Enhanced v10.0 Configuration for Far Far West
+# BHopDash Enhanced v11.0 Configuration for Far Far West
 ENABLED=true
 
-# Keys (handled natively by UE4SS RegisterKeyBind)
-# SpaceBar: Initiates bunnyhop chain while moving
-# LeftShift: Initiates dash-hop chain while moving
+# ALWAYS_BHOP=true:
+# Персонаж автоматически выпрыгивает при КАЖДОМ приземлении (100% авто-баннихоп без необходимости удерживать клавиши!).
+ALWAYS_BHOP=true
 
-# Features
-AUTO_BHOP_ENABLED=true
+# Dash-Hop:
+# Нажатие Shift активирует рывок на приземлении с выпрыгиванием вперед.
 AUTO_DASH_ENABLED=true
 AUTO_JUMP_AFTER_DASH=true
 RESET_DASH_COOLDOWN=true
 
-# Behavior:
-# If ALWAYS_BHOP_WHEN_MOVING=true, character will automatically bhop on EVERY landing while moving forward (zero button pressing needed!).
-# If ALWAYS_BHOP_WHEN_MOVING=false (default), pressing Space while moving initiates the continuous hop chain until you stop moving.
-ALWAYS_BHOP_WHEN_MOVING=false
-
-# Polling interval in milliseconds
+# Частота опроса физики (мс)
 POLL_MS=10
 
-# Debug logging in UE4SS.log
+# Логирование в UE4SS.log
 DEBUG=true

@@ -1,20 +1,20 @@
 --[[
-    BHopDash Enhanced v11.0 for Far Far West
+    BHopDash Enhanced v12.0 for Far Far West
     UE4SS 3.0.x Lua Mod
 
-    Features:
-    - Pure Auto-BHop: Automatically jumps with perfect timing on EVERY landing!
-    - Dash-Hop: Press LeftShift to trigger landing dash + jump launch.
-    - Robust air/ground transition via MovementMode (MOVE_Falling -> MOVE_Walking).
-    - LaunchCharacter + Jump dual execution for 100% reliable physical jumps.
-    - Zero closures, zero registry leaks, zero crash on exit.
+    Fixes:
+    - Eliminates thread race condition in ExecuteInGameThread (input thread no longer calls it).
+    - Prevents loop deadlock by adding a 50ms watchdog timeout to gameTickQueued.
+    - Continuous auto-bhop on holding Space (key-repeat continually extends bhop window).
+    - Re-activates seamlessly on every new Spacebar press without freezing.
+    - Dash-hop on LeftShift.
 --]]
 
 local UEHelpers = require("UEHelpers")
 
 local config = {
     ENABLED = true,
-    ALWAYS_BHOP = true,              -- Automatically jump on every landing!
+    ALWAYS_BHOP = false,             -- If false, holding Space continues hopping; if true, hops on every landing
     AUTO_DASH_ENABLED = true,
     AUTO_JUMP_AFTER_DASH = true,
     RESET_DASH_COOLDOWN = true,
@@ -23,7 +23,6 @@ local config = {
 }
 
 local CONFIG_FILENAME = "ue4ss/Mods/BHopDash/config.txt"
-local DUMP_FILENAME = "ue4ss/Mods/BHopDash/player_functions.txt"
 
 -- Runtime caches
 local cachedPC = nil
@@ -32,12 +31,15 @@ local cachedCM = nil
 
 local wasInAir = false
 local gameTickQueued = false
-local dumpedFunctions = false
+local lastDispatchTime = 0.0
+local lastHeartbeat = 0.0
 
--- State tracking
+-- Thread-safe state flags modified by input thread
 local bhopActiveUntil = 0.0
 local dashHopActiveUntil = 0.0
-local jumpCount = 0
+local spaceTriggerRequested = false
+local shiftTriggerRequested = false
+local jumpCounter = 0
 
 local function log(msg)
     print("[BHopDash] " .. tostring(msg))
@@ -97,38 +99,6 @@ local function isValid(obj)
     return ok and res == true
 end
 
--- Comprehensive scan for player functions in both lobby and match
-local function dumpPlayerFunctions(pawn)
-    if dumpedFunctions or not isValid(pawn) then return end
-    dumpedFunctions = true
-
-    pcall(function()
-        local file = io.open(DUMP_FILENAME, "w")
-        if file then
-            file:write("=== Functions for " .. pawn:GetFullName() .. " ===\n")
-        end
-
-        log("Scanning UFunctions for " .. pawn:GetFullName())
-        ForeachUObject(function(obj)
-            local fullName = obj:GetFullName()
-            if (fullName:find("BP_Player", 1, true)) then
-                if fullName:find("Jump", 1, true) or fullName:find("Dash", 1, true) or fullName:find("Input", 1, true) or fullName:find("InpAct", 1, true) or fullName:find("Land", 1, true) then
-                    log("  UFunction: " .. fullName)
-                    if file then
-                        file:write(fullName .. "\n")
-                    end
-                end
-            end
-            return false
-        end)
-
-        if file then
-            file:close()
-            log("Saved player functions to " .. DUMP_FILENAME)
-        end
-    end)
-end
-
 local function acquirePlayer()
     if isValid(cachedPawn) and isValid(cachedPC) and isValid(cachedCM) then
         return true
@@ -179,14 +149,13 @@ local function acquirePlayer()
     wasInAir = false
 
     log("Local player acquired: " .. pawn:GetFullName())
-    dumpPlayerFunctions(pawn)
     return true
 end
 
 local function executeJump()
     if not isValid(cachedPawn) then return end
 
-    jumpCount = jumpCount + 1
+    jumpCounter = jumpCounter + 1
 
     -- Unreal Character Jump
     pcall(function()
@@ -205,7 +174,7 @@ local function executeJump()
         end
     end)
 
-    log(string.format("Auto-Jump #%d executed!", jumpCount))
+    log(string.format("Auto-Jump #%d executed!", jumpCounter))
 end
 
 local function executeDash()
@@ -243,67 +212,79 @@ local function gameThreadTick()
         return
     end
 
-    -- Check if character is airborne
-    -- EMovementMode: 3 is MOVE_Falling (in air)
-    local mode = 1
-    pcall(function() mode = cachedCM.MovementMode end)
+    local isGrounded = false
+    pcall(function()
+        isGrounded = cachedCM:IsMovingOnGround()
+    end)
 
-    local inAir = (mode == 3)
-    if not inAir then
-        pcall(function() inAir = cachedCM:IsFalling() end)
+    local isFalling = false
+    pcall(function()
+        isFalling = cachedCM:IsFalling()
+    end)
+
+    local inAir = isFalling or (not isGrounded)
+    local now = os.clock()
+
+    -- Process pending initial jump from key press if grounded
+    if spaceTriggerRequested then
+        spaceTriggerRequested = false
+        if isGrounded then
+            executeJump()
+        end
     end
 
-    local now = os.clock()
-    local isBhopTriggered = config.ALWAYS_BHOP or (now < bhopActiveUntil)
-    local isDashTriggered = (now < dashHopActiveUntil)
-
-    -- LANDING DETECTED: was in air on previous tick, now grounded!
-    if wasInAir and not inAir then
-        log(string.format("Landing detected! BhopActive=%s, DashActive=%s", tostring(isBhopTriggered), tostring(isDashTriggered)))
-
-        if isDashTriggered and config.AUTO_DASH_ENABLED then
+    if shiftTriggerRequested then
+        shiftTriggerRequested = false
+        if isGrounded and config.AUTO_DASH_ENABLED then
             executeDash()
-            dashHopActiveUntil = now + 1.5
-        elseif isBhopTriggered then
+        end
+    end
+
+    local isBhopActive = config.ALWAYS_BHOP or (now < bhopActiveUntil)
+    local isDashActive = (now < dashHopActiveUntil)
+
+    -- Landing detection: was airborne last tick, now grounded
+    if wasInAir and not inAir then
+        log(string.format("Landing detected! BhopActive=%s, DashActive=%s", tostring(isBhopActive), tostring(isDashActive)))
+
+        if isDashActive and config.AUTO_DASH_ENABLED then
+            executeDash()
+            dashHopActiveUntil = now + 1.2
+        elseif isBhopActive then
             executeJump()
-            bhopActiveUntil = now + 1.5
+            bhopActiveUntil = now + 1.2
         end
     end
 
     wasInAir = inAir
+
+    -- Heartbeat log every 10 seconds in debug mode to confirm loop health
+    if config.DEBUG and (now - lastHeartbeat >= 10.0) then
+        lastHeartbeat = now
+        log(string.format("Heartbeat: active, grounded=%s, inAir=%s, bhopActive=%s", tostring(isGrounded), tostring(inAir), tostring(isBhopActive)))
+    end
 end
 
+-- Watchdog-protected async loop: guarantees NO deadlocks even on frame drops
 local function asyncLoopCallback()
-    if not gameTickQueued then
+    local now = os.clock()
+    if not gameTickQueued or (now - lastDispatchTime > 0.05) then
         gameTickQueued = true
+        lastDispatchTime = now
         ExecuteInGameThread(gameThreadTick)
     end
     return false
 end
 
--- Static callbacks for KeyBinds
-local function onSpaceKeyGameThread()
-    if acquirePlayer() and isValid(cachedCM) and not cachedCM:IsFalling() then
-        executeJump()
-    end
-end
-
+-- Input thread handlers: ONLY update state flags, ZERO ExecuteInGameThread calls!
 local function onSpaceKeyPressed()
-    bhopActiveUntil = os.clock() + 1.5
-    log("Space pressed -> BHop chain active until " .. string.format("%.2f", bhopActiveUntil))
-    ExecuteInGameThread(onSpaceKeyGameThread)
-end
-
-local function onShiftKeyGameThread()
-    if acquirePlayer() and isValid(cachedCM) and not cachedCM:IsFalling() then
-        executeDash()
-    end
+    bhopActiveUntil = os.clock() + 1.2
+    spaceTriggerRequested = true
 end
 
 local function onShiftKeyPressed()
-    dashHopActiveUntil = os.clock() + 1.5
-    log("Shift pressed -> Dash-Hop chain active until " .. string.format("%.2f", dashHopActiveUntil))
-    ExecuteInGameThread(onShiftKeyGameThread)
+    dashHopActiveUntil = os.clock() + 1.2
+    shiftTriggerRequested = true
 end
 
 -- Initialize
@@ -312,5 +293,5 @@ loadConfig()
 RegisterKeyBind(Key.SPACE, onSpaceKeyPressed)
 RegisterKeyBind(Key.LEFT_SHIFT or 0x10, onShiftKeyPressed)
 
-log(string.format("BHopDash v11.0 active! ALWAYS_BHOP=%s (Auto-hop on every landing).", tostring(config.ALWAYS_BHOP)))
+log("BHopDash v12.0 initialized! Thread-safe, watchdog protected.")
 LoopAsync(config.POLL_MS, asyncLoopCallback)
