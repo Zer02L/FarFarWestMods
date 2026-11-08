@@ -251,14 +251,33 @@ local function create_dynamic_material(parent_mat, name_str)
     local world_ctx = UEHelpers.GetWorldContextObject()
 
     if isValid(kml) and isValid(world_ctx) then
+        -- In UE 5.3+, CreateDynamicMaterialInstance takes 4 parameters:
+        -- (WorldContextObject, Parent, OptionalName, CreationFlags)
         local ok, dyn_mat = pcall(function()
+            return kml:CreateDynamicMaterialInstance(world_ctx, parent_mat, UEHelpers.FindOrAddFName(name_str), 0)
+        end)
+        if ok and isValid(dyn_mat) then
+            return dyn_mat
+        end
+
+        -- Fallback: 3 parameters for older engine versions
+        ok, dyn_mat = pcall(function()
             return kml:CreateDynamicMaterialInstance(world_ctx, parent_mat, UEHelpers.FindOrAddFName(name_str))
+        end)
+        if ok and isValid(dyn_mat) then
+            return dyn_mat
+        end
+
+        -- Fallback: 2 parameters
+        ok, dyn_mat = pcall(function()
+            return kml:CreateDynamicMaterialInstance(world_ctx, parent_mat)
         end)
         if ok and isValid(dyn_mat) then
             return dyn_mat
         end
     end
 
+    LogWarn(string.format("Could not create dynamic material instance for '%s', using base material fallback.", name_str))
     return parent_mat
 end
 
@@ -415,19 +434,41 @@ end
 
 local function apply_highlight_to_mesh(mesh, mid)
     if not isValid(mesh) or not isValid(mid) then return end
+    -- UE 5.1+ UMeshComponent::SetOverlayMaterial requires 3 parameters:
+    -- (NewOverlayMaterial, bSetMaterialSlot, SlotIndex)
     local ok, err = pcall(function()
-        mesh:SetOverlayMaterial(mid)
+        mesh:SetOverlayMaterial(mid, false, 0)
     end)
     if not ok then
+        -- Fallback for older engine versions with 1 parameter
+        ok, err = pcall(function()
+            mesh:SetOverlayMaterial(mid)
+        end)
+    end
+    if not ok then
+        -- Direct UProperty assignment fallback
+        pcall(function()
+            mesh.OverlayMaterial = mid
+        end)
         LogWarn(string.format("Failed to SetOverlayMaterial on mesh: %s", tostring(err)))
     end
 end
 
 local function remove_highlight_from_mesh(mesh, original_native_overlay)
     if not isValid(mesh) then return end
-    pcall(function()
-        mesh:SetOverlayMaterial(original_native_overlay or nil)
+    local ok = pcall(function()
+        mesh:SetOverlayMaterial(original_native_overlay or nil, false, 0)
     end)
+    if not ok then
+        ok = pcall(function()
+            mesh:SetOverlayMaterial(original_native_overlay or nil)
+        end)
+    end
+    if not ok and original_native_overlay == nil then
+        pcall(function()
+            mesh.OverlayMaterial = nil
+        end)
+    end
 end
 
 local function register_enemy(actor)
@@ -721,27 +762,32 @@ local function scan_and_update_enemies()
         if not is_enemy_alive(actor) then
             unregister_enemy(addr)
         else
-            -- Distance culling (if enabled)
+            -- Check distance if camera is available and max distance is configured
+            local in_range = true
             if max_dist_sq > 0 and cam_loc and isValid(math_lib) then
                 local ok_loc, loc = pcall(function() return actor:K2_GetActorLocation() end)
                 if ok_loc and loc then
                     local ok_dist, dist_sq = pcall(function() return math_lib:Vector_DistanceSquared(cam_loc, loc) end)
                     if ok_dist and dist_sq and dist_sq > max_dist_sq then
-                        -- Out of range: temporarily clear overlay
-                        for _, m in ipairs(entry.meshes or {}) do
-                            if isValid(m) then
-                                local native = entry.nativeOverlays and entry.nativeOverlays[tostring(m:GetAddress())]
-                                remove_highlight_from_mesh(m, native)
-                            end
-                        end
-                    elseif Config.Enabled and not entry.isAimed then
-                        -- Within range: ensure tier highlight is applied
-                        local tier_mid = get_tier_mid(entry.tier)
-                        for _, m in ipairs(entry.meshes or {}) do
-                            if isValid(m) then
-                                apply_highlight_to_mesh(m, tier_mid)
-                            end
-                        end
+                        in_range = false
+                    end
+                end
+            end
+
+            if not in_range then
+                -- Out of range: temporarily clear overlay
+                for _, m in ipairs(entry.meshes or {}) do
+                    if isValid(m) then
+                        local native = entry.nativeOverlays and entry.nativeOverlays[tostring(m:GetAddress())]
+                        remove_highlight_from_mesh(m, native)
+                    end
+                end
+            elseif Config.Enabled and not entry.isAimed then
+                -- Within range: ensure tier highlight is applied
+                local tier_mid = get_tier_mid(entry.tier)
+                for _, m in ipairs(entry.meshes or {}) do
+                    if isValid(m) then
+                        apply_highlight_to_mesh(m, tier_mid)
                     end
                 end
             end
