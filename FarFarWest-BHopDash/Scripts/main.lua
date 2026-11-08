@@ -279,13 +279,16 @@ local function gameThreadTick()
     end
 end
 
--- Watchdog-protected async loop: guarantees NO deadlocks even on frame drops
+-- Watchdog-protected async loop fallback for older UE4SS environments
 local function asyncLoopCallback()
     local now = os.clock()
     if not gameTickQueued or (now - lastDispatchTime > 0.05) then
         gameTickQueued = true
         lastDispatchTime = now
-        ExecuteInGameThread(gameThreadTick)
+        ExecuteInGameThread(function()
+            gameTickQueued = false
+            pcall(gameThreadTick)
+        end)
     end
     return false
 end
@@ -307,5 +310,11 @@ loadConfig()
 RegisterKeyBind(Key.SPACE, onSpaceKeyPressed)
 RegisterKeyBind(Key.LEFT_SHIFT or 0x10, onShiftKeyPressed)
 
-log("BHopDash v13.0 initialized! Hold-to-BHop mode active.")
-LoopAsync(config.POLL_MS, asyncLoopCallback)
+log("BHopDash v13.1 initialized! Hold-to-BHop mode active (GameThread synchronized).")
+if LoopInGameThreadWithDelay then
+    LoopInGameThreadWithDelay(config.POLL_MS, function()
+        pcall(gameThreadTick)
+    end)
+else
+    LoopAsync(config.POLL_MS, asyncLoopCallback)
+end
