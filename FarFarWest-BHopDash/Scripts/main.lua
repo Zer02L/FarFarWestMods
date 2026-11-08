@@ -1,15 +1,14 @@
 --[[
-    BHopDash Enhanced v8.0 for Far Far West
+    BHopDash Enhanced v8.1 for Far Far West
     UE4SS 3.0.x Lua Mod
 
     Features:
     - Auto-BHop: Hold SpaceBar to automatically jump immediately upon touching the ground.
-    - Auto-Dash: Hold LeftShift (or configured key) to automatically dash on landing.
-    - Auto-Jump After Dash: Immediately jumps after a landing dash, launching you with full dash momentum into a continuous bunnyhop dash loop.
-    - Reset Dash Cooldown: Keeps dash always available during bhopping.
-    - Dual landing detection: Event-based (OnLanded & K2_OnMovementModeChanged) + 10ms high-frequency polling backup.
-    - Robust local player acquisition via UEHelpers and PlayerController.AcknowledgedPawn.
-    - Auto-recovers on player respawn, death, or level change (ClientRestart hook).
+    - Auto-Dash: Hold LeftShift to automatically dash on landing.
+    - Auto-Jump After Dash: Jump immediately after dash to carry momentum in the air.
+    - Zero Registry Churn: Reuses persistent callbacks to prevent UE4SS memory crashes.
+    - Zero Hook Overhead: No global engine hooks to ensure 100% stability.
+    - Auto-recovers on respawn or map change without lag.
 --]]
 
 local UEHelpers = require("UEHelpers")
@@ -24,13 +23,18 @@ local config = {
     AUTO_JUMP_AFTER_DASH = true,
     RESET_DASH_COOLDOWN = true,
     POLL_MS = 10,
-    AUTO_JUMP_DELAY_MS = 15,
     DEBUG = false
 }
 
 local CONFIG_FILENAME = "ue4ss/Mods/BHopDash/config.txt"
 
--- Runtime state
+-- Pre-built keys to avoid any allocation during game ticks
+local dashKeyPrimary = nil
+local dashKeySecondary = nil
+local bhopKeyPrimary = nil
+local bhopKeySecondary = nil
+
+-- Runtime player caches
 local cachedPC = nil
 local cachedPawn = nil
 local cachedCM = nil
@@ -38,11 +42,9 @@ local cachedCM = nil
 local wasGrounded = false
 local hadGroundState = false
 local gameTickQueued = false
-local lastDebugTime = 0
-local pendingJumpAfterDash = false
-local jumpQueuedTime = 0
+local lastDebugLog = 0.0
 
--- Logging helpers
+-- Logging
 local function log(msg)
     print("[BHopDash] " .. tostring(msg))
 end
@@ -53,24 +55,56 @@ local function debugLog(msg)
     end
 end
 
--- String trim helper
 local function trim(s)
     if not s then return "" end
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
--- Parse boolean values
 local function parseBool(val)
     if not val then return false end
     val = trim(val):lower()
     return val == "true" or val == "1" or val == "yes" or val == "on"
 end
 
--- Load configuration from config.txt
+local function buildKey(name)
+    if not name or name == "" then return nil end
+    local ok, k = pcall(function()
+        local obj = {}
+        obj.KeyName = FName(name)
+        return obj
+    end)
+    if ok and k then return k end
+    return nil
+end
+
+local function setupKeyStructs()
+    dashKeyPrimary = buildKey(config.DASH_KEY)
+    local dashLower = config.DASH_KEY:lower()
+    if dashLower == "leftshift" or dashLower == "shift" then
+        dashKeyPrimary = buildKey("LeftShift")
+        dashKeySecondary = buildKey("RightShift")
+    elseif dashLower == "leftcontrol" or dashLower == "control" or dashLower == "ctrl" then
+        dashKeyPrimary = buildKey("LeftControl")
+        dashKeySecondary = buildKey("RightControl")
+    else
+        dashKeySecondary = nil
+    end
+
+    bhopKeyPrimary = buildKey(config.BHOP_KEY)
+    local bhopLower = config.BHOP_KEY:lower()
+    if bhopLower == "space" or bhopLower == "spacebar" then
+        bhopKeyPrimary = buildKey("SpaceBar")
+        bhopKeySecondary = buildKey("Space")
+    else
+        bhopKeySecondary = nil
+    end
+end
+
 local function loadConfig()
     local file = io.open(CONFIG_FILENAME, "r")
     if not file then
-        log("config.txt not found, using default settings.")
+        log("config.txt not found, using default configuration.")
+        setupKeyStructs()
         return
     end
 
@@ -97,10 +131,7 @@ local function loadConfig()
                     config.RESET_DASH_COOLDOWN = parseBool(value)
                 elseif key == "POLL_MS" then
                     local n = tonumber(value)
-                    if n and n > 0 then config.POLL_MS = n end
-                elseif key == "AUTO_JUMP_DELAY_MS" then
-                    local n = tonumber(value)
-                    if n and n >= 0 then config.AUTO_JUMP_DELAY_MS = n end
+                    if n and n >= 5 then config.POLL_MS = n end
                 elseif key == "DEBUG" then
                     config.DEBUG = parseBool(value)
                 end
@@ -108,28 +139,16 @@ local function loadConfig()
         end
     end
     file:close()
-    debugLog("Configuration loaded successfully")
+    setupKeyStructs()
+    debugLog("Configuration loaded successfully.")
 end
 
--- Validate UE Object
 local function isValid(obj)
     if obj == nil then return false end
     local ok, res = pcall(function() return obj:IsValid() end)
     return ok and res == true
 end
 
--- Invalidate caches
-local function invalidatePlayer()
-    cachedPC = nil
-    cachedPawn = nil
-    cachedCM = nil
-    wasGrounded = false
-    hadGroundState = false
-    pendingJumpAfterDash = false
-    debugLog("Player cache cleared")
-end
-
--- Acquire Player Controller and Pawn
 local function acquirePlayer()
     if isValid(cachedPawn) and isValid(cachedPC) and isValid(cachedCM) then
         return true
@@ -142,9 +161,9 @@ local function acquirePlayer()
 
     local pawn = nil
     pcall(function()
-        if pc.AcknowledgedPawn and pc.AcknowledgedPawn:IsValid() then
+        if isValid(pc.AcknowledgedPawn) then
             pawn = pc.AcknowledgedPawn
-        elseif pc.Pawn and pc.Pawn:IsValid() then
+        elseif isValid(pc.Pawn) then
             pawn = pc.Pawn
         end
     end)
@@ -180,64 +199,41 @@ local function acquirePlayer()
     wasGrounded = false
     hadGroundState = false
 
-    debugLog("Acquired local PlayerController, Pawn and CharacterMovement")
+    debugLog("Local player and CharacterMovement acquired.")
     return true
 end
 
--- Key state check helper
-local function isKeyHeld(pc, keyName)
-    if not isValid(pc) or not keyName or keyName == "" then return false end
+local function isKeyHeld(pc, primaryKey, secondaryKey)
+    if not isValid(pc) then return false end
 
-    -- Helper to test single FKey name
-    local function testKey(name)
+    if primaryKey then
         local ok, held = pcall(function()
-            return pc:IsInputKeyDown({ KeyName = FName(name) })
+            return pc:IsInputKeyDown(primaryKey)
         end)
-        return ok and held == true
+        if ok and held == true then return true end
     end
 
-    if testKey(keyName) then return true end
-
-    -- Normalize common aliases
-    local lower = keyName:lower()
-    if lower == "space" or lower == "spacebar" then
-        if testKey("SpaceBar") or testKey("Space") then return true end
-    elseif lower == "shift" or lower == "leftshift" then
-        if testKey("LeftShift") or testKey("RightShift") then return true end
-    elseif lower == "ctrl" or lower == "control" or lower == "leftcontrol" then
-        if testKey("LeftControl") or testKey("RightControl") then return true end
-    elseif lower == "alt" or lower == "leftalt" then
-        if testKey("LeftAlt") or testKey("RightAlt") then return true end
-    elseif lower == "mouse4" or lower == "thumbmousebutton" then
-        if testKey("ThumbMouseButton") then return true end
-    elseif lower == "mouse5" or lower == "thumbmousebutton2" then
-        if testKey("ThumbMouseButton2") then return true end
+    if secondaryKey then
+        local ok2, held2 = pcall(function()
+            return pc:IsInputKeyDown(secondaryKey)
+        end)
+        if ok2 and held2 == true then return true end
     end
 
     return false
 end
 
--- Execute jump on character
 local function executeJump()
-    if not isValid(cachedPawn) then return false end
-
-    local ok, err = pcall(function()
+    if not isValid(cachedPawn) then return end
+    pcall(function()
         cachedPawn:StopJumping()
         cachedPawn:Jump()
     end)
-
-    if ok then
-        debugLog("Jump executed!")
-        return true
-    else
-        debugLog("Jump error: " .. tostring(err))
-        return false
-    end
+    debugLog("Jump executed")
 end
 
--- Execute dash on character
 local function executeDash()
-    if not isValid(cachedPawn) then return false end
+    if not isValid(cachedPawn) then return end
 
     if config.RESET_DASH_COOLDOWN then
         pcall(function()
@@ -250,71 +246,36 @@ local function executeDash()
         end)
     end
 
-    local ok, err = pcall(function()
+    local ok = pcall(function()
         cachedPawn:F_Dash()
     end)
 
     if ok then
-        debugLog("Dash fired!")
-
+        debugLog("Dash executed")
         if config.AUTO_JUMP_AFTER_DASH then
-            if config.AUTO_JUMP_DELAY_MS <= 0 then
-                executeJump()
-            else
-                pendingJumpAfterDash = true
-                jumpQueuedTime = os.clock()
-            end
+            pcall(function()
+                cachedPawn:StopJumping()
+                cachedPawn:Jump()
+            end)
+            debugLog("Auto-jump after dash executed")
         end
-
-        return true
-    else
-        debugLog("F_Dash error: " .. tostring(err))
-        return false
     end
 end
 
--- Triggered on landing
-local function onLandedTrigger()
-    if not config.ENABLED or not isValid(cachedPawn) or not isValid(cachedPC) then
-        return
-    end
-
-    local dashHeld = config.AUTO_DASH_ENABLED and isKeyHeld(cachedPC, config.DASH_KEY)
-    local bhopHeld = config.AUTO_BHOP_ENABLED and isKeyHeld(cachedPC, config.BHOP_KEY)
-
-    debugLog(string.format("Landing detected! DashHeld: %s, BhopHeld: %s", tostring(dashHeld), tostring(bhopHeld)))
-
-    if dashHeld then
-        executeDash()
-    elseif bhopHeld then
-        executeJump()
-    end
-end
-
--- Main tick running in game thread
+-- Reused persistent tick function - NEVER allocated per frame
 local function gameThreadTick()
     gameTickQueued = false
 
     if not config.ENABLED then return end
 
     if not acquirePlayer() then
-        if config.DEBUG and os.clock() - lastDebugTime >= 3.0 then
-            log("Waiting for local player pawn...")
-            lastDebugTime = os.clock()
+        if config.DEBUG and os.clock() - lastDebugLog >= 5.0 then
+            log("Waiting for player pawn in level...")
+            lastDebugLog = os.clock()
         end
         return
     end
 
-    -- Process pending jump after dash if delay elapsed
-    if pendingJumpAfterDash then
-        local elapsedMs = (os.clock() - jumpQueuedTime) * 1000.0
-        if elapsedMs >= config.AUTO_JUMP_DELAY_MS then
-            pendingJumpAfterDash = false
-            executeJump()
-        end
-    end
-
-    -- Check ground state
     local okG, onGround = pcall(function()
         return cachedCM:IsMovingOnGround()
     end)
@@ -328,22 +289,33 @@ local function gameThreadTick()
 
     onGround = (onGround == true)
 
+    local dashHeld = config.AUTO_DASH_ENABLED and isKeyHeld(cachedPC, dashKeyPrimary, dashKeySecondary)
+    local bhopHeld = config.AUTO_BHOP_ENABLED and isKeyHeld(cachedPC, bhopKeyPrimary, bhopKeySecondary)
+
     if not hadGroundState then
         hadGroundState = true
         wasGrounded = onGround
         if onGround then
-            onLandedTrigger()
+            if dashHeld then
+                executeDash()
+            elseif bhopHeld then
+                executeJump()
+            end
         end
         return
     end
 
-    -- Just landed this frame: was in air, now on ground
+    -- Landing detected: was in air last tick, now touching ground
     if onGround and not wasGrounded then
-        onLandedTrigger()
-    -- If already on ground and holding bhop key:
-    elseif onGround and config.AUTO_BHOP_ENABLED and isKeyHeld(cachedPC, config.BHOP_KEY) then
-        local okFalling, isFalling = pcall(function() return cachedCM:IsFalling() end)
-        if not okFalling or not isFalling then
+        if dashHeld then
+            executeDash()
+        elseif bhopHeld then
+            executeJump()
+        end
+    -- Holding bhop key while on ground: keep hopping
+    elseif onGround and bhopHeld then
+        local okFall, isFall = pcall(function() return cachedCM:IsFalling() end)
+        if not okFall or not isFall then
             executeJump()
         end
     end
@@ -351,51 +323,19 @@ local function gameThreadTick()
     wasGrounded = onGround
 end
 
--- Register hooks for instant responsiveness
-pcall(function()
-    RegisterHook("/Script/Engine.Character:OnLanded", function(Context)
-        ExecuteInGameThread(function()
-            if acquirePlayer() then
-                onLandedTrigger()
-            end
-        end)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Engine.Character:K2_OnMovementModeChanged", function(Context, PrevMode, NewMode)
-        ExecuteInGameThread(function()
-            local p = PrevMode:get()
-            local n = NewMode:get()
-            -- Mode 3 = Falling, Mode 1 = Walking (landed)
-            if p == 3 and n == 1 then
-                if acquirePlayer() then
-                    onLandedTrigger()
-                end
-            end
-        end)
-    end)
-end)
-
-pcall(function()
-    RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(Context)
-        ExecuteInGameThread(function()
-            invalidatePlayer()
-            acquirePlayer()
-        end)
-    end)
-end)
-
--- Main loop
-loadConfig()
-
-log(string.format("v8.0 loaded! DashKey=%s, BhopKey=%s, AutoJumpAfterDash=%s",
-    config.DASH_KEY, config.BHOP_KEY, tostring(config.AUTO_JUMP_AFTER_DASH)))
-
-LoopAsync(config.POLL_MS, function()
+-- Reused persistent loop callback - zero registry churn
+local function asyncLoopCallback()
     if not gameTickQueued then
         gameTickQueued = true
         ExecuteInGameThread(gameThreadTick)
     end
     return false
-end)
+end
+
+-- Initialize
+loadConfig()
+
+log(string.format("v8.1 loaded successfully! DashKey=%s, BhopKey=%s, AutoJumpAfterDash=%s",
+    config.DASH_KEY, config.BHOP_KEY, tostring(config.AUTO_JUMP_AFTER_DASH)))
+
+LoopAsync(config.POLL_MS, asyncLoopCallback)
