@@ -175,11 +175,36 @@ end
 
 -- ==================== MATERIAL & SHADER MANAGER ====================
 local MATERIAL_CANDIDATES = {
-    "/Game/FX/Materials/M_FX_GlowLight.M_FX_GlowLight",
-    "/Game/FX/Materials/Element_Cryptic/M_FX_Cryptic_OrbShield_Translucent.M_FX_Cryptic_OrbShield_Translucent",
     "/Game/Materials/M_Translucent_Orange.M_Translucent_Orange",
+    "/Game/Materials/M_Translucent_Red.M_Translucent_Red",
+    "/Game/Materials/M_Translucent_Green.M_Translucent_Green",
+    "/Game/Materials/M_Translucent_Blue.M_Translucent_Blue",
     "/Game/Materials/M_Translucent.M_Translucent",
+    "/Game/Materials/M_BackgroundGlow.M_BackgroundGlow",
+    "/Game/FX/Materials/Element_Cryptic/M_FX_Cryptic_OrbShield_Translucent.M_FX_Cryptic_OrbShield_Translucent",
     "/Engine/EngineDebugMaterials/M_SimpleUnlitTranslucent.M_SimpleUnlitTranslucent",
+}
+
+local TIER_BASE_PATHS = {
+    Regular = {
+        "/Game/Materials/M_Translucent_Orange.M_Translucent_Orange",
+        "/Game/Materials/M_Translucent.M_Translucent",
+    },
+    Elite = {
+        "/Game/Materials/M_Translucent_Green.M_Translucent_Green",
+        "/Game/Materials/M_Translucent_Orange.M_Translucent_Orange",
+        "/Game/Materials/M_Translucent.M_Translucent",
+    },
+    Boss = {
+        "/Game/Materials/M_Translucent_Red.M_Translucent_Red",
+        "/Game/Materials/M_Translucent_Orange.M_Translucent_Orange",
+        "/Game/Materials/M_Translucent.M_Translucent",
+    },
+    Aimed = {
+        "/Game/Materials/M_Translucent_Blue.M_Translucent_Blue",
+        "/Game/Materials/M_Translucent_Orange.M_Translucent_Orange",
+        "/Game/Materials/M_Translucent.M_Translucent",
+    },
 }
 
 local VECTOR_PARAM_NAMES = {
@@ -187,10 +212,9 @@ local VECTOR_PARAM_NAMES = {
 }
 
 local SCALAR_PARAM_NAMES = {
-    "Intensity", "EmissiveIntensity", "GlowIntensity", "Density", "FresnelPower", "FresnelExponent", "RimPower", "Power", "Exponent", "Alpha", "Opacity"
+    "Intensity", "EmissiveIntensity", "GlowIntensity", "Density", "FresnelPower", "FresnelExponent", "RimPower", "Power", "Exponent", "Alpha", "Opacity", "DepthBias"
 }
 
-local CachedBaseMaterial = nil
 local MIDs = {
     Regular = nil,
     Elite   = nil,
@@ -198,21 +222,47 @@ local MIDs = {
     Aimed   = nil,
 }
 
-local function find_base_material()
-    if isValid(CachedBaseMaterial) then
-        return CachedBaseMaterial
+local function load_material(path)
+    if not path or path == "" then return nil end
+
+    local ok, mat = pcall(StaticFindObject, path)
+    if ok and isValid(mat) then
+        return mat
     end
 
-    for _, path in ipairs(MATERIAL_CANDIDATES) do
-        local ok, mat = pcall(StaticFindObject, path)
+    if LoadAsset then
+        local ok_load, loaded = pcall(LoadAsset, path)
+        if ok_load and isValid(loaded) then
+            return loaded
+        end
+        ok, mat = pcall(StaticFindObject, path)
         if ok and isValid(mat) then
-            CachedBaseMaterial = mat
-            LogInfo(string.format("Found base highlight material: %s", path))
-            return CachedBaseMaterial
+            return mat
         end
     end
 
     return nil
+end
+
+local function find_base_material_for_tier(tier)
+    local candidates = TIER_BASE_PATHS[tier]
+    if candidates then
+        for _, path in ipairs(candidates) do
+            local mat = load_material(path)
+            if isValid(mat) then
+                return mat, path
+            end
+        end
+    end
+
+    for _, path in ipairs(MATERIAL_CANDIDATES) do
+        local mat = load_material(path)
+        if isValid(mat) then
+            return mat, path
+        end
+    end
+
+    return nil, nil
 end
 
 local function apply_mid_parameters(mid, linear_color, intensity, exponent, alpha)
@@ -237,6 +287,8 @@ local function apply_mid_parameters(mid, linear_color, intensity, exponent, alph
                 mid:SetScalarParameterValue(UEHelpers.FindOrAddFName(param), exponent)
             elseif param:find("Alpha") or param:find("Opacity") then
                 mid:SetScalarParameterValue(UEHelpers.FindOrAddFName(param), alpha)
+            elseif param == "DepthBias" then
+                mid:SetScalarParameterValue(UEHelpers.FindOrAddFName(param), 0.0)
             else
                 mid:SetScalarParameterValue(UEHelpers.FindOrAddFName(param), intensity)
             end
@@ -282,23 +334,28 @@ local function create_dynamic_material(parent_mat, name_str)
 end
 
 local function refresh_all_materials()
-    local base_mat = find_base_material()
-    if not base_mat then
+    local regular_mat, reg_path = find_base_material_for_tier("Regular")
+    if not regular_mat then
         LogWarn("No valid base material found for highlights yet. Will retry when level loads.")
         return false
     end
 
-    MIDs.Regular = create_dynamic_material(base_mat, "EnemyHighlight_Regular")
-    MIDs.Elite   = create_dynamic_material(base_mat, "EnemyHighlight_Elite")
-    MIDs.Boss    = create_dynamic_material(base_mat, "EnemyHighlight_Boss")
-    MIDs.Aimed   = create_dynamic_material(base_mat, "EnemyHighlight_Aimed")
+    local elite_mat, elite_path = find_base_material_for_tier("Elite")
+    local boss_mat, boss_path   = find_base_material_for_tier("Boss")
+    local aimed_mat, aimed_path = find_base_material_for_tier("Aimed")
+
+    MIDs.Regular = create_dynamic_material(regular_mat, "EnemyHighlight_Regular")
+    MIDs.Elite   = create_dynamic_material(elite_mat or regular_mat, "EnemyHighlight_Elite")
+    MIDs.Boss    = create_dynamic_material(boss_mat or regular_mat, "EnemyHighlight_Boss")
+    MIDs.Aimed   = create_dynamic_material(aimed_mat or regular_mat, "EnemyHighlight_Aimed")
 
     apply_mid_parameters(MIDs.Regular, Config.EnemyColor, Config.IntensityMultiplier, Config.FresnelExponent, Config.InnerAlpha)
     apply_mid_parameters(MIDs.Elite,   Config.EliteColor, Config.IntensityMultiplier * 1.25, Config.FresnelExponent, Config.InnerAlpha)
     apply_mid_parameters(MIDs.Boss,    Config.BossColor,  Config.IntensityMultiplier * 1.5,  Config.FresnelExponent, Config.InnerAlpha)
     apply_mid_parameters(MIDs.Aimed,   Config.AimedColor, Config.AimedIntensity,      Config.FresnelExponent * 0.9, Config.InnerAlpha * 1.5)
 
-    LogInfo("Dynamic highlight materials initialized successfully.")
+    LogInfo(string.format("Dynamic highlight materials initialized (Reg: %s, Elite: %s, Boss: %s, Aim: %s).",
+        tostring(reg_path), tostring(elite_path), tostring(boss_path), tostring(aimed_path)))
     return true
 end
 
@@ -496,9 +553,16 @@ local function get_overlay_mode(mesh, mid)
     return overlayMode
 end
 
+local has_logged_mesh_overlay = false
+
 local function apply_highlight_to_mesh(mesh, mid)
     if not isValid(mesh) or not isValid(mid) then return end
     local mode = get_overlay_mode(mesh, mid)
+
+    -- Ensure overlay material is never culled by draw distance
+    pcall(function()
+        mesh:SetOverlayMaterialMaxDrawDistance(0.0)
+    end)
 
     if mode == "m3" then
         if not pcall(function() mesh:SetOverlayMaterial(mid, false, 0) end) then
@@ -536,6 +600,13 @@ local function apply_highlight_to_mesh(mesh, mid)
     if mode == "prop" then
         -- Direct UProperty assignment fallback + forced proxy rebuild
         set_overlay_property(mesh, mid)
+    end
+
+    if not has_logged_mesh_overlay then
+        has_logged_mesh_overlay = true
+        local ok_om, om = pcall(function() return mesh:GetOverlayMaterial() end)
+        LogInfo(string.format("Applied highlight overlay: mode=%s, GetOverlayMaterial=%s (%s)",
+            mode, tostring(ok_om and isValid(om)), tostring(ok_om and om and om:GetFullName())))
     end
 end
 
