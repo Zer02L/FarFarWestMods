@@ -175,8 +175,8 @@ end
 
 -- ==================== MATERIAL & SHADER MANAGER ====================
 local MATERIAL_CANDIDATES = {
-    "/Game/FX/Materials/Element_Cryptic/M_FX_Cryptic_OrbShield_Translucent.M_FX_Cryptic_OrbShield_Translucent",
     "/Game/FX/Materials/M_FX_GlowLight.M_FX_GlowLight",
+    "/Game/FX/Materials/Element_Cryptic/M_FX_Cryptic_OrbShield_Translucent.M_FX_Cryptic_OrbShield_Translucent",
     "/Game/Materials/M_Translucent_Orange.M_Translucent_Orange",
     "/Game/Materials/M_Translucent.M_Translucent",
     "/Engine/EngineDebugMaterials/M_SimpleUnlitTranslucent.M_SimpleUnlitTranslucent",
@@ -434,37 +434,59 @@ end
 
 local function apply_highlight_to_mesh(mesh, mid)
     if not isValid(mesh) or not isValid(mid) then return end
-    -- UE 5.1+ UMeshComponent::SetOverlayMaterial requires 3 parameters:
-    -- (NewOverlayMaterial, bSetMaterialSlot, SlotIndex)
-    local ok, err = pcall(function()
+    -- 1. UE 5.1+ Global Mesh Overlay
+    local ok = pcall(function()
         mesh:SetOverlayMaterial(mid, false, 0)
     end)
     if not ok then
-        -- Fallback for older engine versions with 1 parameter
-        ok, err = pcall(function()
+        pcall(function()
             mesh:SetOverlayMaterial(mid)
         end)
     end
-    if not ok then
-        -- Direct UProperty assignment fallback
-        pcall(function()
-            mesh.OverlayMaterial = mid
-        end)
-        LogWarn(string.format("Failed to SetOverlayMaterial on mesh: %s", tostring(err)))
-    end
+
+    -- 2. Material slot overlay pass (ensures visibility on meshes that render per-slot overlays)
+    pcall(function()
+        local num_mats = mesh:GetNumMaterials()
+        if num_mats and num_mats > 0 then
+            for i = 0, num_mats - 1 do
+                pcall(function()
+                    mesh:SetOverlayMaterial(mid, true, i)
+                end)
+            end
+        end
+    end)
+
+    -- 3. Direct UProperty assignment fallback
+    pcall(function()
+        mesh.OverlayMaterial = mid
+    end)
 end
 
 local function remove_highlight_from_mesh(mesh, original_native_overlay)
     if not isValid(mesh) then return end
+    -- Clear global overlay
     local ok = pcall(function()
         mesh:SetOverlayMaterial(original_native_overlay or nil, false, 0)
     end)
     if not ok then
-        ok = pcall(function()
+        pcall(function()
             mesh:SetOverlayMaterial(original_native_overlay or nil)
         end)
     end
-    if not ok and original_native_overlay == nil then
+
+    -- Clear all material slots
+    pcall(function()
+        local num_mats = mesh:GetNumMaterials()
+        if num_mats and num_mats > 0 then
+            for i = 0, num_mats - 1 do
+                pcall(function()
+                    mesh:SetOverlayMaterial(nil, true, i)
+                end)
+            end
+        end
+    end)
+
+    if original_native_overlay == nil then
         pcall(function()
             mesh.OverlayMaterial = nil
         end)
