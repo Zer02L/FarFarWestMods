@@ -1,6 +1,13 @@
 --[[
-    BHopDash Enhanced v14.0 for Far Far West
+    BHopDash Enhanced v14.1 for Far Far West
     UE4SS 3.0.x Lua Mod
+
+    Key improvements in v14.1:
+    - FIX: IsInputKeyDown argument must be a table keyed by the FKey struct's
+      own field name `KeyName` (FName), NOT `Key`. UE4SS converts argument
+      tables by iterating the struct's reflected fields, so `{ Key = ... }` was
+      silently ignored and the game always received an empty FKey -> always
+      false, which made the v14.0 self-check suspend polling on every session.
 
     Key improvements in v14.0:
     - REAL hold detection: UE4SS RegisterKeyBind is edge-triggered (it fires once
@@ -134,11 +141,12 @@ end
 -- press-time window can never represent "currently held". We instead ask the game
 -- itself: APlayerController::IsInputKeyDown(FKey Key) is BlueprintCallable and
 -- reflects the exact key state the game is processing right now.
-local function tryInputKeyDown(pc, variant, keyName)
-    if variant == 1 then
-        return pc:IsInputKeyDown({ Key = FName(keyName) })
-    end
-    return pc:IsInputKeyDown({ Key = keyName })
+-- FKey is a struct whose only reflected field is `KeyName` (FName), NOT `Key`
+-- (the UFunction parameter is *named* Key, but UE4SS converts the argument table
+-- by iterating the struct's own fields, so a `Key` key is silently ignored and
+-- IsInputKeyDown receives an empty FKey -> always false, with no error raised).
+local function tryInputKeyDown(pc, keyName)
+    return pc:IsInputKeyDown({ KeyName = FName(keyName) })
 end
 
 -- Returns the live held-state of `keyName`.
@@ -156,17 +164,20 @@ local function pollKeyHeld(pc, keyName, fallback, edgeTime, st)
     local lastErr = nil
 
     if inputPoll.variant == 0 then
-        for _, v in ipairs({ 1, 2 }) do
-            local ok, res = pcall(tryInputKeyDown, pc, v, keyName)
-            if ok and type(res) == "boolean" then
-                inputPoll.variant = v
-                got = res
-                break
-            end
+        -- Only the `KeyName` field exists on FKey; any other table key is
+        -- silently ignored by UE4SS and would make the probe "accept" a dead
+        -- call form, so there is deliberately no second variant here.
+        local ok, res = pcall(tryInputKeyDown, pc, keyName)
+        if ok and type(res) == "boolean" then
+            inputPoll.variant = 1
+            got = res
+            log(string.format("IsInputKeyDown probe accepted (first result: %s)",
+                tostring(res)))
+        else
             lastErr = res
         end
     else
-        local ok, res = pcall(tryInputKeyDown, pc, inputPoll.variant, keyName)
+        local ok, res = pcall(tryInputKeyDown, pc, keyName)
         if ok and type(res) == "boolean" then
             got = res
         else
@@ -436,7 +447,7 @@ loadConfig()
 RegisterKeyBind(Key.SPACE, onSpaceKeyPressed)
 RegisterKeyBind(Key.LEFT_SHIFT or 0x10, onShiftKeyPressed)
 
-log("BHopDash v14.0 initialized! Hold-to-BHop with live IsInputKeyDown polling (GameThread synchronized).")
+log("BHopDash v14.1 initialized! Hold-to-BHop with live IsInputKeyDown polling (GameThread synchronized).")
 if LoopInGameThreadWithDelay then
     LoopInGameThreadWithDelay(config.POLL_MS, function()
         pcall(gameThreadTick)
