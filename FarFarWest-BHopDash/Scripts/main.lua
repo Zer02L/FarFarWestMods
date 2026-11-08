@@ -1,13 +1,14 @@
 --[[
-    BHopDash Enhanced v12.0 for Far Far West
+    BHopDash Enhanced v13.0 for Far Far West
     UE4SS 3.0.x Lua Mod
 
-    Fixes:
-    - Eliminates thread race condition in ExecuteInGameThread (input thread no longer calls it).
-    - Prevents loop deadlock by adding a 50ms watchdog timeout to gameTickQueued.
-    - Continuous auto-bhop on holding Space (key-repeat continually extends bhop window).
-    - Re-activates seamlessly on every new Spacebar press without freezing.
-    - Dash-hop on LeftShift.
+    Key improvements in v13.0:
+    - Hold-to-BHop: Auto-bhop works strictly while Spacebar is held down.
+    - Immediate stop on release: Releasing Space immediately stops bhopping on landing.
+    - Single tap produces a single normal jump.
+    - No artificial timer extension on landing (bhopActiveUntil loop removed).
+    - Prevents double-execution on landing frames.
+    - Thread-safe input handling with watchdog-protected async tick loop.
 --]]
 
 local UEHelpers = require("UEHelpers")
@@ -15,6 +16,7 @@ local UEHelpers = require("UEHelpers")
 local config = {
     ENABLED = true,
     ALWAYS_BHOP = false,             -- If false, holding Space continues hopping; if true, hops on every landing
+    SPACE_HOLD_WINDOW = 0.30,        -- Seconds window to consider key currently held (OS key-repeat interval)
     AUTO_DASH_ENABLED = true,
     AUTO_JUMP_AFTER_DASH = true,
     RESET_DASH_COOLDOWN = true,
@@ -35,8 +37,8 @@ local lastDispatchTime = 0.0
 local lastHeartbeat = 0.0
 
 -- Thread-safe state flags modified by input thread
-local bhopActiveUntil = 0.0
-local dashHopActiveUntil = 0.0
+local lastSpacePressTime = 0.0
+local lastShiftPressTime = 0.0
 local spaceTriggerRequested = false
 local shiftTriggerRequested = false
 local jumpCounter = 0
@@ -74,6 +76,9 @@ local function loadConfig()
                     config.ENABLED = parseBool(value)
                 elseif key == "ALWAYS_BHOP" then
                     config.ALWAYS_BHOP = parseBool(value)
+                elseif key == "SPACE_HOLD_WINDOW" or key == "HOLD_WINDOW" then
+                    local n = tonumber(value)
+                    if n and n >= 0.05 and n <= 2.0 then config.SPACE_HOLD_WINDOW = n end
                 elseif key == "AUTO_DASH_ENABLED" then
                     config.AUTO_DASH_ENABLED = parseBool(value)
                 elseif key == "AUTO_JUMP_AFTER_DASH" then
@@ -90,7 +95,8 @@ local function loadConfig()
         end
     end
     file:close()
-    log(string.format("Config loaded: ALWAYS_BHOP=%s, AUTO_DASH=%s", tostring(config.ALWAYS_BHOP), tostring(config.AUTO_DASH_ENABLED)))
+    log(string.format("Config loaded: ALWAYS_BHOP=%s, SPACE_HOLD_WINDOW=%.2fs, AUTO_DASH=%s",
+        tostring(config.ALWAYS_BHOP), config.SPACE_HOLD_WINDOW, tostring(config.AUTO_DASH_ENABLED)))
 end
 
 local function isValid(obj)
@@ -225,34 +231,41 @@ local function gameThreadTick()
     local inAir = isFalling or (not isGrounded)
     local now = os.clock()
 
-    -- Process pending initial jump from key press if grounded
-    if spaceTriggerRequested then
-        spaceTriggerRequested = false
-        if isGrounded then
-            executeJump()
-        end
-    end
-
-    if shiftTriggerRequested then
-        shiftTriggerRequested = false
-        if isGrounded and config.AUTO_DASH_ENABLED then
-            executeDash()
-        end
-    end
-
-    local isBhopActive = config.ALWAYS_BHOP or (now < bhopActiveUntil)
-    local isDashActive = (now < dashHopActiveUntil)
+    local spaceHeld = (now - lastSpacePressTime <= config.SPACE_HOLD_WINDOW)
+    local shiftHeld = (now - lastShiftPressTime <= config.SPACE_HOLD_WINDOW)
+    local isBhopActive = config.ALWAYS_BHOP or spaceHeld
+    local isDashActive = shiftHeld
 
     -- Landing detection: was airborne last tick, now grounded
     if wasInAir and not inAir then
-        log(string.format("Landing detected! BhopActive=%s, DashActive=%s", tostring(isBhopActive), tostring(isDashActive)))
+        -- Consume any pending triggers from airborne repeats so they don't double-fire
+        spaceTriggerRequested = false
+        shiftTriggerRequested = false
+
+        log(string.format("Landing detected! spaceHeld=%s, isBhopActive=%s, shiftHeld=%s",
+            tostring(spaceHeld), tostring(isBhopActive), tostring(shiftHeld)))
 
         if isDashActive and config.AUTO_DASH_ENABLED then
             executeDash()
-            dashHopActiveUntil = now + 1.2
         elseif isBhopActive then
             executeJump()
-            bhopActiveUntil = now + 1.2
+        else
+            log("Space released: BHop stopped on landing.")
+        end
+    else
+        -- Ground-based initial triggers (starting jump or dash while grounded)
+        if shiftTriggerRequested then
+            shiftTriggerRequested = false
+            if isGrounded and config.AUTO_DASH_ENABLED then
+                executeDash()
+            end
+        end
+
+        if spaceTriggerRequested then
+            spaceTriggerRequested = false
+            if isGrounded then
+                executeJump()
+            end
         end
     end
 
@@ -261,7 +274,8 @@ local function gameThreadTick()
     -- Heartbeat log every 10 seconds in debug mode to confirm loop health
     if config.DEBUG and (now - lastHeartbeat >= 10.0) then
         lastHeartbeat = now
-        log(string.format("Heartbeat: active, grounded=%s, inAir=%s, bhopActive=%s", tostring(isGrounded), tostring(inAir), tostring(isBhopActive)))
+        log(string.format("Heartbeat: active, grounded=%s, inAir=%s, spaceHeld=%s",
+            tostring(isGrounded), tostring(inAir), tostring(spaceHeld)))
     end
 end
 
@@ -278,12 +292,12 @@ end
 
 -- Input thread handlers: ONLY update state flags, ZERO ExecuteInGameThread calls!
 local function onSpaceKeyPressed()
-    bhopActiveUntil = os.clock() + 1.2
+    lastSpacePressTime = os.clock()
     spaceTriggerRequested = true
 end
 
 local function onShiftKeyPressed()
-    dashHopActiveUntil = os.clock() + 1.2
+    lastShiftPressTime = os.clock()
     shiftTriggerRequested = true
 end
 
@@ -293,5 +307,5 @@ loadConfig()
 RegisterKeyBind(Key.SPACE, onSpaceKeyPressed)
 RegisterKeyBind(Key.LEFT_SHIFT or 0x10, onShiftKeyPressed)
 
-log("BHopDash v12.0 initialized! Thread-safe, watchdog protected.")
+log("BHopDash v13.0 initialized! Hold-to-BHop mode active.")
 LoopAsync(config.POLL_MS, asyncLoopCallback)
